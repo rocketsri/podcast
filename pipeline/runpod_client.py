@@ -60,7 +60,7 @@ class RunPodClient:
         resp = self._session.request(
             method, url, headers=self._headers(), json=json_body, timeout=self._timeout
         )
-        if resp.status_code not in (200, 201):
+        if resp.status_code not in (200, 201, 204):
             raise RunPodError(f"RunPod {method} {path} returned HTTP {resp.status_code}: {resp.text[:500]}")
         if not resp.content:
             return {}
@@ -85,7 +85,7 @@ class RunPodClient:
         volume_in_gb: int = 0,
         env: dict[str, str] | None = None,
         docker_start_cmd: list[str] | None = None,
-        ports: str | None = None,
+        ports: list[str] | None = None,
     ) -> dict:
         body = {
             "name": name,

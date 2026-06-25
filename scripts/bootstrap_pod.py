@@ -1,5 +1,10 @@
-"""Creates N RunPod GPU pods, each assigned a disjoint shard of the queued
-episode pool, running infra/bootstrap.sh as the pod's dockerStartCmd.
+"""Creates N RunPod GPU pods, each running infra/bootstrap.sh as the pod's
+dockerStartCmd. Each pod clones the repo, discovers its own independent
+batch of episodes via scripts/select_podcasts_free.py (no PodcastIndex
+credentials configured for this run), and processes everything it finds in
+single-pod mode -- see infra/bootstrap.sh's docstring for why pods don't
+share one pre-partitioned queue the way the original R2-tarball design's
+--shard model assumed.
 
 RunPod's create-pod API has no way to fetch an arbitrary file at container
 start, so infra/bootstrap.sh's own source is read off disk here and passed
@@ -9,19 +14,16 @@ inline as `["bash", "-c", <script text>]` -- the script carries no secrets
 the code tarball.
 
 SPENDS REAL MONEY the moment --confirm is passed. Without --confirm this
-only prints the plan (pod count, GPU type, per-shard episode counts,
-assumed hourly rate, hours-to-BUDGET_CAP_USD) and exits -- per PLAN.md's
-"notify before the first dollar is spent" requirement. Run
-scripts/partition_episodes.py --shards N first so each shard has a
-nonempty queue.
+only prints the plan (pod count, GPU type, assumed hourly rate,
+hours-to-BUDGET_CAP_USD) and exits -- per PLAN.md's "notify before the
+first dollar is spent" requirement.
 
 Code reaches the pod via `git clone` (infra/bootstrap.sh), not the R2
-tarball PLAN.md originally described -- the orchestrating environment this
-script runs from cannot reach R2's per-account subdomains (live-confirmed
-proxy TLS block), so scripts/package_code.py's upload step is skipped for
-this path. R2 is still used for everything the pod itself does (clip/
-manifest/heartbeat upload), since that traffic comes from RunPod's network,
-not this one. Pass --github-token if the repo isn't public.
+tarball PLAN.md originally described -- git clone was already working and
+there was no reason to switch back once R2 turned out to be reachable too
+(see infra/bootstrap.sh). R2 is still used for everything the pod itself
+does (clip/manifest/heartbeat upload). Pass --github-token if the repo
+isn't public.
 
 Run with: python3 scripts/bootstrap_pod.py --num-pods N --confirm
 """
@@ -34,7 +36,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from pipeline import config, db, logging_utils  # noqa: E402
+from pipeline import config, logging_utils  # noqa: E402
 from pipeline.runpod_client import GPU_TYPE_IDS, RunPodClient, RunPodError  # noqa: E402
 
 logger = logging_utils.get_logger()
@@ -44,13 +46,6 @@ DEFAULT_IMAGE = "runpod/pytorch:1.0.7-cu1281-torch271-ubuntu2204"
 DEFAULT_GPU_TYPE_ID = "NVIDIA GeForce RTX 3090"  # PLAN.md's locked-in compute choice
 DEFAULT_GIT_REPO_URL = "https://github.com/rocketsri/podcast.git"
 DEFAULT_GIT_BRANCH = "claude/podcast-speech-builder-e0kfs5"
-
-
-def shard_episode_counts(conn, num_pods: int) -> list[int]:
-    return [
-        len(db.list_queued_episodes(conn, shard=shard_id)) + len(db.list_failed_episodes(conn, shard=shard_id))
-        for shard_id in range(num_pods)
-    ]
 
 
 def build_env(
@@ -75,8 +70,7 @@ def build_env(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--num-pods", type=int, required=True, help="number of GPU pods to create, one per shard 0..N-1")
-    parser.add_argument("--db", default=str(db.DEFAULT_DB_PATH))
+    parser.add_argument("--num-pods", type=int, required=True, help="number of independent GPU pods to create")
     parser.add_argument("--gpu-type-id", default=DEFAULT_GPU_TYPE_ID, choices=GPU_TYPE_IDS)
     parser.add_argument("--cloud-type", default="COMMUNITY", choices=["COMMUNITY", "SECURE"])
     parser.add_argument("--container-disk-gb", type=int, default=30)
@@ -121,22 +115,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     bootstrap_script = BOOTSTRAP_SCRIPT_PATH.read_text()
 
-    conn = db.connect(args.db)
-    db.init_db(conn)
-    counts = shard_episode_counts(conn, args.num_pods)
-    if sum(counts) == 0:
-        logger.error(
-            "no episodes assigned to shards 0..%d -- run scripts/partition_episodes.py --shards %d first",
-            args.num_pods - 1, args.num_pods,
-        )
-        return 1
-
     total_hourly = args.assumed_hourly_usd * args.num_pods
     print("=== bootstrap_pod.py plan ===")
     print(f"image: {args.image}")
     print(f"gpu_type_id: {args.gpu_type_id}  x{args.num_pods} pods  ({args.cloud_type})")
-    for shard_id, count in enumerate(counts):
-        print(f"  shard {shard_id}: {count} episodes queued/failed-resumable")
+    print("each pod discovers its own episode batch at boot (scripts/select_podcasts_free.py) -- no pre-partitioned queue to report here")
     print(f"assumed rate: ${args.assumed_hourly_usd:.2f}/hr/pod -> ${total_hourly:.2f}/hr combined")
     if total_hourly > 0:
         print(f"budget cap (BUDGET_CAP_USD): ${secrets.budget_cap_usd:.2f} -> ~{secrets.budget_cap_usd / total_hourly:.1f}h of combined runtime before the cap")
@@ -160,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
                 container_disk_in_gb=args.container_disk_gb,
                 env=env,
                 docker_start_cmd=["bash", "-c", bootstrap_script],
-                ports="8080/http",
+                ports=["8080/http"],
             )
         except RunPodError as exc:
             logger.error("failed to create pod for shard %d: %s", shard_id, exc)
