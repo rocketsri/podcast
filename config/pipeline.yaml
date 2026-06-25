@@ -1,0 +1,72 @@
+# All pipeline tunables. Defaults here were chosen pre-Stage-1; the values marked
+# "(tune at Stage 1)" are expected to move after listening to real clips, per
+# WRITEUP.md's prior-art note on Libri-Light's recommendation to set such
+# thresholds from per-file histograms rather than hardcoding them upfront.
+
+models:
+  vad: silero_vad
+  diarization: pyannote/speaker-diarization-3.1   # bundles its own embedding sub-model; no separate embedding model/pass needed (see clustering.* below)
+  asr: base   # faster-whisper model size
+
+audio:
+  target_sample_rate: 16000
+  target_channels: 1
+  clip_format: flac
+
+vad:
+  min_speech_confidence: 0.5   # (tune at Stage 1) floor for vad_low_confidence discard
+
+segmentation:
+  min_clip_duration_seconds: 1.0
+  max_clip_duration_seconds: 30.0
+  short_clip_target_seconds: 10.0
+  pause_search_window_seconds: 2.0
+  pause_probability_floor: 0.5   # (tune at Stage 1) a cut point only counts as a "clean pause" if the best Silero frame-probability in the search window is below this; otherwise segment.py forces a hard cut
+  target_bucket_ratios:        # aggregate duration-distribution targets, see segment.py
+    under_10s: 0.70
+    from_10_to_20s: 0.25
+    from_20_to_30s: 0.05
+
+quality:
+  vad_low_confidence_floor: 0.6          # (tune at Stage 1) stricter than vad.min_speech_confidence's detection floor -- a clip's own average confidence must clear this to count as clean enough for the corpus
+  rms_silence_floor_db: -45.0           # silence_or_low_energy; LibriSpeech/Libri-Light SNR-style precedent
+  overlap_edge_trim_seconds: 0.2
+  music_spectral_flatness_floor: 0.35   # heuristic, weakest filter — see LIMITATIONS.md
+  low_asr_confidence_no_speech_prob: 0.6
+  low_asr_confidence_avg_logprob: -1.2
+  ad_heuristic_spectral_flatness_floor: 0.20   # heuristic only, deliberately weaker than music_spectral_flatness_floor -- see LIMITATIONS.md
+  ad_heuristic_no_speech_prob_floor: 0.35
+  intro_outro_window_seconds: 30.0
+
+clustering:
+  match_threshold: 0.75          # (tune at Stage 1) cosine-similarity match floor, podcast-scoped
+  recluster_every_n_episodes: 5
+  embedding_exclude_overlap: true            # diarize.py passes this straight to SpeakerDiarization(embedding_exclude_overlap=...) -- excludes crosstalk frames from each local speaker's centroid
+  min_local_speaker_seconds_for_embedding: 1.5   # a local speaker's total speech time in the episode must clear this floor before its pyannote-provided centroid is trusted for cross-episode matching
+
+cost:
+  budget_cap_usd: 100.0
+  time_cap_hours: 24.0
+  budget_soft_stop_fraction: 0.9
+  time_soft_stop_fraction: 0.9
+  assumed_gpu_hourly_usd: 0.30   # overwritten by run_meta with the actual booked rate
+
+target_corpus:
+  clean_hours_target: 100.0
+  assumed_yield_fraction: 0.65        # (tune at Stage 1) clean/raw hour ratio after VAD+overlap+discards
+  raw_hours_pool_min: 150.0           # clean_hours_target / assumed_yield_fraction, rounded up for hedge
+  raw_hours_pool_max: 200.0
+  podcast_count_min: 10
+  podcast_count_max: 20
+  episodes_per_podcast_min: 8
+  episodes_per_podcast_max: 12
+
+parallelism:
+  stage2_wallclock_budget_hours: 12.0   # deliberately < 24h cap, leaves margin for smoke test/Stage1/merge/report
+  pod_count_safety_margin: 0.25         # +20-30% over the raw pods_needed formula result
+  recluster_every_n_episodes: 5         # mirrors clustering.recluster_every_n_episodes, kept in sync manually
+
+monitoring:
+  status_http_port: 8080                # served on RunPod's exposed proxy port, redundant alongside the R2 status push
+  heartbeat_push_interval_seconds: 60    # also pushed unconditionally after every episode finishes, regardless of timer
+  stale_heartbeat_minutes: 15            # (tune at Stage 1) poll_status.py's threshold for stopping a pod whose heartbeat goes stale

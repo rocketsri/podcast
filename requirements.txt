@@ -1,0 +1,26 @@
+# Core
+PyYAML==6.0.2
+requests==2.32.3
+boto3==1.35.99
+
+# Audio
+numpy==1.26.4
+soundfile==0.12.1
+
+# VAD
+torch==2.5.1
+torchaudio==2.5.1
+silero-vad==6.2.1
+
+# Diarization / speaker embeddings
+pyannote.audio==3.3.2
+
+# ASR (quality-filter signal + optional transcript)
+faster-whisper==1.1.1
+
+# Clustering
+scikit-learn==1.5.2
+scipy==1.13.1
+
+# Testing
+pytest==8.3.4
