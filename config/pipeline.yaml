@@ -43,6 +43,7 @@ clustering:
   recluster_every_n_episodes: 5
   embedding_exclude_overlap: true            # diarize.py passes this straight to SpeakerDiarization(embedding_exclude_overlap=...) -- excludes crosstalk frames from each local speaker's centroid
   min_local_speaker_seconds_for_embedding: 1.5   # a local speaker's total speech time in the episode must clear this floor before its pyannote-provided centroid is trusted for cross-episode matching
+  dominant_speaker_warn_threshold: 0.92   # flag an episode if one local label holds >=this share of total speech across >=2 detected labels -- catches clustering collapse (see PROBLEMS.md) at ingest time instead of only on manual transcript review
 
 cost:
   budget_cap_usd: 100.0

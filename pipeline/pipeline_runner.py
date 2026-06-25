@@ -180,6 +180,20 @@ def _ensure_diarized_and_clustered(ctx: RunContext, episode_row: sqlite3.Row) ->
         raise StageFailure(str(exc)) from exc
     db.advance_stage(ctx.conn, episode_id, "diarized")
 
+    dominant = diarize.dominant_speaker_share(result.turns)
+    if dominant is not None:
+        label, share, num_labels = dominant
+        if num_labels >= 2 and share >= ctx.cfg.clustering.dominant_speaker_warn_threshold:
+            logger.warning(
+                "episode %s: diarization looks collapsed -- label %s holds %.1f%% of speech across "
+                "%d detected labels (>=%d%% threshold); likely a clustering/threshold problem, not a "
+                "genuinely solo episode -- see PROBLEMS.md",
+                episode_id, label, share * 100, num_labels, int(ctx.cfg.clustering.dominant_speaker_warn_threshold * 100),
+            )
+            db.set_run_meta(
+                ctx.conn, f"dominant_speaker_warning_{episode_id}", f"{label}:{share:.4f}:{num_labels}",
+            )
+
     try:
         label_to_speaker = cluster.ingest_episode_diarization(
             ctx.conn, episode_id, podcast_id, result.turns, result.embeddings,

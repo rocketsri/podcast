@@ -8,8 +8,8 @@ numpy==1.26.4
 soundfile==0.12.1
 
 # VAD
-torch==2.5.1
-torchaudio==2.5.1
+torch>=2.5.1
+torchaudio>=2.5.1
 silero-vad==6.2.1
 
 # Diarization / speaker embeddings
