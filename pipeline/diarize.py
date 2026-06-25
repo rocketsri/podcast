@@ -27,10 +27,12 @@ all-zero vector is not a real embedding.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
-from pyannote.audio import Pipeline
+
+if TYPE_CHECKING:
+    from pyannote.audio import Pipeline
 
 PIPELINE_CHECKPOINT = "pyannote/speaker-diarization-3.1"
 
@@ -52,7 +54,10 @@ class DiarizationResult:
     embeddings: dict[str, np.ndarray] = field(default_factory=dict)  # local_label -> centroid, only for labels that cleared the speech-duration floor
 
 
-def load_pipeline(hf_token: str, device: str = "cuda", embedding_exclude_overlap: bool = True) -> Pipeline:
+def load_pipeline(hf_token: str, device: str = "cuda", embedding_exclude_overlap: bool = True) -> "Pipeline":
+    import torch
+    from pyannote.audio import Pipeline
+
     if not hf_token:
         raise DiarizationError("HF_TOKEN required to load gated pyannote pipeline")
     pipeline = Pipeline.from_pretrained(PIPELINE_CHECKPOINT, use_auth_token=hf_token)
@@ -68,7 +73,7 @@ def load_pipeline(hf_token: str, device: str = "cuda", embedding_exclude_overlap
 
 def diarize(
     audio_path: str,
-    pipeline: Pipeline,
+    pipeline: "Pipeline",
     min_local_speaker_seconds_for_embedding: float = 1.5,
 ) -> DiarizationResult:
     """Run diarization once on a transcoded (16kHz mono wav) episode file."""

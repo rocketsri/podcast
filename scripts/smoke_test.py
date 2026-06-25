@@ -64,7 +64,7 @@ def check_host_reachable(name: str, url: str) -> CheckResult:
 def run_network_only_checks(secrets: config.EnvSecrets) -> list[CheckResult]:
     hosts = {
         "podcastindex": "https://api.podcastindex.org/api/1.0/search/byterm",
-        "runpod": "https://rest.runpod.io/v1/gpuTypes",
+        "runpod": "https://rest.runpod.io/v1/openapi.json",
         "huggingface": "https://huggingface.co",
     }
     if secrets.r2_account_id:

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import requests
 
-from pipeline import db
+from pipeline import db, discovery
 
 DOWNLOAD_CHUNK_BYTES = 1 << 20  # 1MB
 
@@ -34,6 +34,21 @@ def register_episode_from_podcastindex(conn, podcast_id: str, pi_episode: dict) 
         source_url=pi_episode["enclosureUrl"],
         published_at=str(published_at) if published_at else None,
         duration_seconds_reported=float(duration) if duration else None,
+    )
+    return episode_id
+
+
+def register_episode_from_rss(conn, podcast_id: str, rss_episode: discovery.RssEpisode) -> str:
+    """Inserts one discovery.fetch_rss_feed episode as a queued episode row
+    -- RSS sibling of register_episode_from_podcastindex, idempotent the
+    same way (db.insert_episode's INSERT OR IGNORE). Returns episode_id."""
+    episode_id = f"{podcast_id}_ep_{discovery.episode_slug_for_guid(rss_episode.guid)}"
+    db.insert_episode(
+        conn, episode_id, podcast_id, rss_episode.guid,
+        title=rss_episode.title,
+        source_url=rss_episode.enclosure_url,
+        published_at=rss_episode.published_at,
+        duration_seconds_reported=rss_episode.duration_seconds,
     )
     return episode_id
 

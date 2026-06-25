@@ -1,21 +1,19 @@
-"""RunPod REST API v1 client: pod lifecycle (create/list/get/stop/resume/
-terminate) and GPU type listing. Used by scripts/smoke_test.py,
-scripts/bootstrap_pod.py, and scripts/poll_status.py -- the three scripts
-that need to talk to RunPod, sharing one auth/request implementation rather
-than each rolling their own.
+"""RunPod REST API v1 client: pod lifecycle (create/list/get/stop/start/
+terminate). Used by scripts/smoke_test.py and scripts/bootstrap_pod.py --
+the scripts that need to talk to RunPod, sharing one auth/request
+implementation rather than each rolling their own.
 
-VERIFICATION STATUS: this sandbox's network egress proxy hard-blocks
-rest.runpod.io and docs.runpod.io (confirmed via direct 403 policy-denial
-responses, including to RunPod's own OpenAPI spec endpoint), so the exact
-endpoint paths and request/response field names below could not be
-confirmed against RunPod's live API reference at write time. They reflect
-RunPod's published REST API v1 conventions (Bearer auth, /pods and
-/gpuTypes resources) as documented as of this codebase's writing, not a
-verified live call. Field names are isolated to _build_create_pod_body()
-and the per-method paths below specifically so they're easy to correct in
-one place once network access is available -- which must happen before
-the first real pod-creation call (see the smoke-test gate in
-scripts/bootstrap_pod.py and run_pipeline's plan).
+VERIFICATION STATUS: confirmed live against
+https://rest.runpod.io/v1/openapi.json (reachable from this environment,
+no auth required to fetch the spec itself). There is no /gpuTypes (or
+/gpu-types) resource in the real v1 API -- gpuTypeIds takes one of the
+display-name strings enumerated in the PodCreateInput schema (e.g.
+"NVIDIA GeForce RTX 4090", "NVIDIA A40"); GPU_TYPE_IDS below is that enum,
+kept here so callers don't need to fetch the spec themselves. Pod
+lifecycle is POST /pods, GET/PATCH/DELETE /pods/{podId}, and
+POST /pods/{podId}/{stop,start,restart,reset,update} -- there is no
+"resume" verb (the real path is "start"). dockerStartCmd/dockerEntrypoint
+are arrays of argv tokens, not a single shell string.
 """
 
 from __future__ import annotations
@@ -24,6 +22,18 @@ import requests
 
 API_BASE = "https://rest.runpod.io/v1"
 USER_AGENT = "podcast-speech-dataset-pipeline/1.0"
+
+# A sample of the gpuTypeIds enum from PodCreateInput (live openapi.json,
+# https://rest.runpod.io/v1/openapi.json) -- not exhaustive, just enough
+# known-good ids to pick from without re-fetching the spec at runtime.
+GPU_TYPE_IDS = (
+    "NVIDIA GeForce RTX 3090",  # PLAN.md's locked-in compute choice
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA A40",
+    "NVIDIA RTX A5000",
+    "NVIDIA GeForce RTX 5090",
+    "NVIDIA H100 80GB HBM3",
+)
 
 
 class RunPodError(RuntimeError):
@@ -50,16 +60,11 @@ class RunPodClient:
         resp = self._session.request(
             method, url, headers=self._headers(), json=json_body, timeout=self._timeout
         )
-        if resp.status_code not in (200, 201):
+        if resp.status_code not in (200, 201, 204):
             raise RunPodError(f"RunPod {method} {path} returned HTTP {resp.status_code}: {resp.text[:500]}")
         if not resp.content:
             return {}
         return resp.json()
-
-    def list_gpu_types(self) -> list[dict]:
-        """Returns available GPU types with id/displayName/pricing fields."""
-        data = self._request("GET", "/gpuTypes")
-        return data if isinstance(data, list) else data.get("gpuTypes", [])
 
     def list_pods(self) -> list[dict]:
         data = self._request("GET", "/pods")
@@ -79,8 +84,8 @@ class RunPodClient:
         container_disk_in_gb: int = 20,
         volume_in_gb: int = 0,
         env: dict[str, str] | None = None,
-        docker_start_cmd: str | None = None,
-        ports: str | None = None,
+        docker_start_cmd: list[str] | None = None,
+        ports: list[str] | None = None,
     ) -> dict:
         body = {
             "name": name,
@@ -101,12 +106,12 @@ class RunPodClient:
     def stop_pod(self, pod_id: str) -> dict:
         return self._request("POST", f"/pods/{pod_id}/stop")
 
-    def resume_pod(self, pod_id: str) -> dict:
-        return self._request("POST", f"/pods/{pod_id}/resume")
+    def start_pod(self, pod_id: str) -> dict:
+        return self._request("POST", f"/pods/{pod_id}/start")
 
     def terminate_pod(self, pod_id: str) -> None:
         self._request("DELETE", f"/pods/{pod_id}")
 
     def check_connectivity(self) -> None:
         """Cheap auth-validating call for scripts/smoke_test.py; raises RunPodError on failure."""
-        self.list_gpu_types()
+        self.list_pods()
