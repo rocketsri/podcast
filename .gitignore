@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+work/
+*.db
+*.db-wal
+*.db-shm
+*.wav
+*.flac
+*.mp3
+*.log
+.pytest_cache/
+.DS_Store
