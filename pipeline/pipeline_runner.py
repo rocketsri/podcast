@@ -56,6 +56,7 @@ class RunContext:
     pod_id: str = "local-pod"
     shard_id: int | None = None
     latest_status: dict = field(default_factory=dict)
+    diarize_fn: object = None  # (audio_path, pipeline, min_local_speaker_seconds_for_embedding) -> diarize.DiarizationResult; defaults to diarize.diarize
 
 
 class StageFailure(RuntimeError):
@@ -169,7 +170,8 @@ def _ensure_diarized_and_clustered(ctx: RunContext, episode_row: sqlite3.Row) ->
 
     db.advance_stage(ctx.conn, episode_id, "diarizing")
     try:
-        result = diarize.diarize(
+        diarize_fn = ctx.diarize_fn or diarize.diarize
+        result = diarize_fn(
             episode_row["local_wav_path"], ctx.models.diarize_pipeline,
             min_local_speaker_seconds_for_embedding=ctx.cfg.clustering.min_local_speaker_seconds_for_embedding,
         )

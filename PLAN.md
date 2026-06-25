@@ -27,11 +27,12 @@ does.
 - [x] #16 `pipeline/ingest.py` + `pipeline/pipeline_runner.py` + `run_pipeline.py`
 - [ ] #17 **in progress** `scripts/`:
   - [x] `select_podcasts.py`
+  - [x] `select_podcasts_free.py` (no-signup iTunes+RSS sibling, used for the live free-tier trial)
   - [x] `smoke_test.py`
   - [x] `partition_episodes.py`
   - [x] `package_code.py`
-  - [ ] `bootstrap_pod.py` -- not started
-  - [ ] `poll_status.py` -- not started
+  - [x] `bootstrap_pod.py` -- creates N RunPod pods via the now-live-verified RunPodClient; dry-run-by-default, prints cost plan, requires `--confirm` to actually spend money
+  - [x] `poll_status.py` -- cross-references RunPod's pod lifecycle state against each pod's R2 heartbeat (heartbeat.py), flags stale/erroring pods
   - [ ] `merge_shards.py` -- not started
   - [ ] `report.py` -- not started
   - [ ] `validate_manifest.py` -- not started
@@ -64,21 +65,32 @@ does.
   a clean tarball of `pipeline/` + `config/` + `requirements.txt` +
   `run_pipeline.py`, excluding `__pycache__`.
 
-## Known gap: `pipeline/runpod_client.py` is UNVERIFIED against live docs
+## Resolved: `pipeline/runpod_client.py` is now live-verified
 
-This sandbox's egress proxy hard-blocked `rest.runpod.io` *and*
-`docs.runpod.io` (confirmed via direct 403 policy-denial responses, not a
-transient error), so the exact endpoint paths and request/response field
-names in `pipeline/runpod_client.py` reflect RunPod's published REST API v1
-conventions (Bearer auth, `/pods` and `/gpuTypes` resources) from training
-knowledge, not a verified live call. **Before writing `bootstrap_pod.py`'s
-pod-creation call (which spends real money) or running
-`scripts/smoke_test.py`'s full RunPod check for real, confirm the actual
-endpoint shapes against RunPod's live API reference** (e.g. fetch
-`https://rest.runpod.io/v1/openapi.json` or the docs site) and fix
-`pipeline/runpod_client.py` if anything doesn't match. The field names are
-deliberately isolated in one place (`RunPodClient.create_pod`'s body dict
-and the per-method paths) specifically to make this a small, contained fix.
+An earlier session's docstring claimed this sandbox's egress proxy
+hard-blocked `rest.runpod.io`/`docs.runpod.io`. That was wrong, or has since
+changed: `https://rest.runpod.io/v1/openapi.json` is reachable, unauthenticated,
+from this sandbox, and was fetched and diffed against `runpod_client.py`'s
+assumptions. Findings and fixes applied:
+- There is no `/gpuTypes` resource at all -- removed the dead
+  `list_gpu_types()` method. `gpuTypeIds` is an array of plain display-name
+  strings drawn from an enum embedded in `PodCreateInput`; the known-good
+  subset (including the locked-in `"NVIDIA GeForce RTX 3090"`) is now the
+  `GPU_TYPE_IDS` module constant, sourced from the live spec.
+- `dockerStartCmd`/`dockerEntrypoint` are arrays of argv tokens, not a
+  shell string -- `create_pod`'s `docker_start_cmd` param is now
+  `list[str] | None`.
+- There is no `/pods/{podId}/resume` verb; the real one is `start` --
+  `resume_pod` was renamed to `start_pod` hitting `/pods/{podId}/start`.
+- `check_connectivity()` now calls `list_pods()` instead of the removed
+  `list_gpu_types()`.
+All three corrected paths were live-curl-verified to return `401`
+(auth-required, i.e. the path itself resolves) rather than the earlier
+`400` "path not in spec" error, with no real API key in hand. Still
+genuinely untested end-to-end against a real pod (no `RUNPOD_API_KEY` yet)
+-- `infra/bootstrap.sh` (the pod entrypoint) and `scripts/bootstrap_pod.py`
+(the launcher) are written and self-consistent with this client but
+unexercised; treat the first real pod creation as the actual test.
 
 ## Immediate next steps in a session with network access
 

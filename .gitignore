@@ -4,6 +4,7 @@ __pycache__/
 venv/
 .env
 work/
+work_free_trial/
 *.db
 *.db-wal
 *.db-shm
