@@ -249,3 +249,59 @@ same selected episode set, but pods claim their shortest known episodes
 first. This only takes effect for a queue fetched after this change (i.e.
 a fresh `run_pipeline.py` start), so applying it to already-running pods
 requires relaunching them.
+
+## 12. All 6 relaunched pods crash-looped for 20+ minutes, burning money with zero output
+
+**Problem.** After the #10/#11 relaunch, all 6 pods sat at 0% GPU, 0% CPU,
+and zero R2 objects for 20-35 minutes -- looked at first like a slow but
+healthy boot (heavy `pyannote.audio` pip install, model download,
+discovery). Pulling `podcast-shard-5`'s actual container logs (RunPod
+GraphQL/REST expose no log endpoint we have access to, so this required
+the user to paste them in manually) showed something much worse: the pod
+was not slowly booting, it was crash-restarting every ~16 seconds, in a
+loop with no exit condition, the entire time.
+
+**Root cause, two compounding bugs.** (1) `infra/bootstrap.sh` ran bare
+`pip install --quiet -r requirements.txt`, which returned in well under
+15 seconds total (clone + cd + install + mkdir combined) -- far too fast
+to have actually installed `pyannote.audio`'s real dependency tree. It
+resolved to a different interpreter/environment than the `python3` used
+to run `select_podcasts_free.py` immediately after, so `import yaml`
+(requirements.txt's first package) raised `ModuleNotFoundError` and the
+script exited nonzero under `set -euo pipefail`. (2) This is itself just
+one crash -- the part that made it unrecoverable was that RunPod restarts
+this container's entrypoint automatically on exit (directly observed:
+~16s between identical log cycles, for 20+ minutes straight). That
+contradicts what problem #10 assumed ("RunPod doesn't restart a container
+whose process exited") -- it does, at least for this pod/image
+configuration. Once bug #1 crashed the container the first time, every
+subsequent restart's `git clone` failed immediately too
+(`destination path '/workspace/podcast' already exists and is not an
+empty directory`, since the leftover directory from the first attempt was
+never cleaned up), permanently locking the pod into a loop that could
+never get past the clone step again -- regardless of whether the original
+pip/yaml bug would have eventually self-resolved.
+
+**Fix.** `infra/bootstrap.sh`: (a) made the clone step idempotent --
+if `$WORKDIR/.git` already exists (an earlier attempt in the same
+container), `git fetch` + `reset --hard` in place instead of failing;
+(b) replaced the bare `pip install` with `python3 -m pip install` so
+the install target is guaranteed to be the same interpreter every later
+step uses; (c) added a fail-fast `python3 -c "import yaml, torch,
+pyannote.audio, faster_whisper"` check immediately after install that
+exits with a clear `[bootstrap] FATAL` message instead of letting a
+missing dependency surface 20+ lines deep in `select_podcasts_free.py`'s
+traceback. Problem #10's "RunPod doesn't restart a container whose
+process exited" is left as-is below (historical record of what was
+believed at the time), but this entry supersedes it: assume RunPod
+**will** retry a crashed container's entrypoint, which makes idempotent
+boot steps a correctness requirement, not a nice-to-have.
+
+**Cost impact.** All 6 pods ran in this useless loop for the entire
+20-35 minute window between the #10/#11 relaunch and this fix --
+6 pods x ~0.5h x ~$0.30/hr is small in absolute dollars, but 100% of it
+produced zero usable output, and the same bug would have silently
+repeated on every future relaunch until logs were manually pulled and
+read by a human, since no telemetry channel available to this session
+(GraphQL runtime stats, R2 heartbeat) can distinguish a crash loop from a
+slow-but-healthy boot.

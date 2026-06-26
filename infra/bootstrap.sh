@@ -26,10 +26,9 @@
 # centralized and the resulting db handed to each pod (e.g. via R2, now
 # that it's confirmed reachable) instead of run independently per pod.
 #
-# UNTESTED: written against the live-verified RunPod REST v1 shape
-# (pipeline/runpod_client.py) but never run on an actual pod before this
-# launch. Treat this first real run as the test; check the pod's logs
-# closely.
+# First real run (6 pods) surfaced two bugs that turned a transient failure
+# into a permanent, money-burning crash loop: see PROBLEMS.md #12. Both are
+# fixed below (idempotent clone, `python3 -m pip`, fail-fast import check).
 set -euo pipefail
 
 GIT_REPO_URL="${GIT_REPO_URL:-https://github.com/rocketsri/podcast.git}"
@@ -44,11 +43,39 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
     clone_url="https://${GITHUB_TOKEN}@${GIT_REPO_URL#https://}"
 fi
 
-echo "[bootstrap] cloning ${GIT_REPO_URL} (branch ${GIT_BRANCH})..."
-git clone --depth 1 --branch "$GIT_BRANCH" "$clone_url" "$WORKDIR"
+# RunPod restarts this container's entrypoint on a crash (observed directly:
+# a pod stuck on the yaml ModuleNotFoundError below was relaunched by RunPod
+# every ~16s for 20+ minutes -- contrary to what was previously assumed in
+# PROBLEMS.md #10). A bare `git clone` into an already-populated $WORKDIR
+# fails outright, which turned that one transient failure into a permanent
+# boot loop on every pod, since the second-and-later attempts could never
+# even get past the clone step. Make this idempotent: reuse the existing
+# clone (fetch + hard reset) if one is already there instead of failing.
+if [ -d "$WORKDIR/.git" ]; then
+    echo "[bootstrap] ${WORKDIR} already has a clone from an earlier attempt in this container -- updating in place..."
+    git -C "$WORKDIR" fetch --depth 1 origin "$GIT_BRANCH"
+    git -C "$WORKDIR" checkout -f "$GIT_BRANCH"
+    git -C "$WORKDIR" reset --hard "origin/$GIT_BRANCH"
+else
+    echo "[bootstrap] cloning ${GIT_REPO_URL} (branch ${GIT_BRANCH})..."
+    git clone --depth 1 --branch "$GIT_BRANCH" "$clone_url" "$WORKDIR"
+fi
 cd "$WORKDIR"
 
-pip install --quiet -r requirements.txt
+# Bare `pip install` resolved to a different interpreter than `python3`
+# below it on the actual pod (observed: it returned in under ~15s total --
+# far too fast to have really installed pyannote.audio's dependency tree --
+# and yaml, requirements.txt's very first package, was then missing from
+# the `python3` that runs select_podcasts_free.py). `python3 -m pip`
+# guarantees the install target is the same interpreter every later step
+# uses. The import check fails loudly and immediately instead of silently,
+# so a recurrence shows up as one clear line instead of 20+ minutes of
+# pods crash-looping with no GPU/CPU/R2 signal at all.
+echo "[bootstrap] installing python deps..."
+python3 -m pip install -r requirements.txt
+python3 -c "import yaml, torch, pyannote.audio, faster_whisper" \
+    || { echo "[bootstrap] FATAL: core deps not importable after install -- aborting" >&2; exit 1; }
+echo "[bootstrap] python deps OK"
 
 mkdir -p work
 echo "[bootstrap] discovering episodes (free iTunes+RSS path, no PodcastIndex creds needed)..."
