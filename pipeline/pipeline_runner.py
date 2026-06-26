@@ -61,6 +61,7 @@ class RunContext:
     db_path: str | Path | None = None  # local sqlite file backing `conn` -- needed to snapshot it to R2 (see _snapshot_db_to_r2)
     log_path: str | Path | None = None  # local log file backing logging_utils.configure_logging -- needed to sync it to R2 (see _sync_log_to_r2)
     num_pods: int = 1  # this run's total pod count, for dividing cost.budget_cap_usd fairly (see costs.per_pod_budget_cap_usd)
+    r2_key_prefix: str = ""  # nests every clip/manifest/status/db_snapshot/log key under this run's own namespace -- see config.EnvSecrets.r2_key_prefix
 
 
 class StageFailure(RuntimeError):
@@ -306,7 +307,7 @@ def _ensure_exported_and_uploaded(ctx: RunContext, episode_row: sqlite3.Row) -> 
         try:
             if ctx.storage_client is not None and ctx.bucket is not None:
                 audio_path = storage.upload_clip(
-                    ctx.storage_client, ctx.bucket, local_flac_path, podcast_id, episode_id, clip["clip_id"]
+                    ctx.storage_client, ctx.bucket, local_flac_path, podcast_id, episode_id, clip["clip_id"], ctx.r2_key_prefix,
                 )
                 # upload_file() not raising is not sufficient evidence the bytes
                 # landed -- observed live on the RunPod fleet: every upload_file()
@@ -315,7 +316,7 @@ def _ensure_exported_and_uploaded(ctx: RunContext, episode_row: sqlite3.Row) -> 
                 # something on the pod's network path faking a 2xx instead of
                 # erroring. A real head_object check closes that gap before we
                 # trust the flag enough to ever delete the only copy.
-                key = storage.clip_key(podcast_id, episode_id, clip["clip_id"])
+                key = storage.clip_key(podcast_id, episode_id, clip["clip_id"], ctx.r2_key_prefix)
                 if not storage.object_exists(ctx.storage_client, ctx.bucket, key):
                     raise RuntimeError(f"upload_file reported success for {key} but object_exists is False after")
                 uploaded_count += 1
@@ -404,7 +405,7 @@ def _snapshot_db_to_r2(ctx: RunContext) -> None:
         return
     try:
         ctx.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        storage.upload_file(ctx.storage_client, ctx.bucket, ctx.db_path, storage.db_snapshot_key(ctx.pod_id))
+        storage.upload_file(ctx.storage_client, ctx.bucket, ctx.db_path, storage.db_snapshot_key(ctx.pod_id, ctx.r2_key_prefix))
     except Exception:
         logger.exception("db snapshot upload to R2 failed -- continuing (next checkpoint will retry)")
 
@@ -413,7 +414,7 @@ def _sync_log_to_r2(ctx: RunContext) -> None:
     if ctx.storage_client is None or ctx.bucket is None or ctx.log_path is None:
         return
     try:
-        logging_utils.sync_log_to_r2(ctx.storage_client, ctx.bucket, ctx.pod_id, ctx.log_path)
+        logging_utils.sync_log_to_r2(ctx.storage_client, ctx.bucket, ctx.pod_id, ctx.log_path, ctx.r2_key_prefix)
     except Exception:
         logger.exception("log sync to R2 failed -- continuing")
 
@@ -423,7 +424,7 @@ def _push_heartbeat(ctx: RunContext) -> None:
     status = heartbeat.build_status(ctx.conn, ctx.pod_id, ctx.shard_id, pod_started_at)
     if ctx.storage_client is not None and ctx.bucket is not None:
         try:
-            heartbeat.push_status_to_r2(ctx.storage_client, ctx.bucket, ctx.pod_id, status)
+            heartbeat.push_status_to_r2(ctx.storage_client, ctx.bucket, ctx.pod_id, status, ctx.r2_key_prefix)
         except Exception as exc:
             # Swallowing this exception used to leave the R2 push's own failure mode
             # completely invisible -- poll_status.py only reads R2, so a pod whose R2

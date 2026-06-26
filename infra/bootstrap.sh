@@ -73,6 +73,18 @@ cd "$WORKDIR"
 # pods crash-looping with no GPU/CPU/R2 signal at all.
 echo "[bootstrap] installing python deps..."
 python3 -m pip install -r requirements.txt
+# The base image ships its own torchvision built against its original (newer)
+# torch -- requirements.txt downgrades torch/torchaudio to 2.5.1 for pyannote
+# but doesn't touch torchvision, so the preinstalled one is left paired with
+# the wrong torch version. pyannote.audio's import chain (pytorch_lightning
+# -> torchmetrics) conditionally imports torchvision if present, which then
+# raises "partially initialized module 'torchvision' has no attribute
+# 'extension' (most likely due to a circular import)" -- confirmed live on a
+# real GPU pod (runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404). Nothing in
+# this codebase uses torchvision, so just remove it instead of chasing a
+# torch/torchvision pin that would otherwise need to track every RunPod base
+# image's bundled version.
+python3 -m pip uninstall -y torchvision
 python3 -c "import yaml, torch, pyannote.audio, faster_whisper" \
     || { echo "[bootstrap] FATAL: core deps not importable after install -- aborting" >&2; exit 1; }
 echo "[bootstrap] python deps OK"

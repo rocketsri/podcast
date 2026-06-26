@@ -34,35 +34,55 @@ def build_client(secrets: config.EnvSecrets):
         aws_access_key_id=secrets.r2_access_key_id,
         aws_secret_access_key=secrets.r2_secret_access_key,
         region_name="auto",
-        config=BotoConfig(retries={"max_attempts": 4, "mode": "standard"}),
+        # max_attempts=4 was enough in the single-pod trial but under-budgeted
+        # for 6 pods writing concurrently -- observed live as real episode
+        # failures ("ServiceUnavailable: Reduce your concurrent request rate"
+        # / "429 Too Many Requests") once the full fleet was running. Standard
+        # mode already does exponential backoff with jitter; just give it more
+        # attempts to ride out fleet-scale throttling.
+        config=BotoConfig(retries={"max_attempts": 8, "mode": "standard"}),
     )
 
 
-def clip_key(podcast_id: str, episode_id: str, clip_id: str) -> str:
-    return f"clips/{podcast_id}/{episode_id}/{clip_id}.flac"
+def _prefixed(key_prefix: str, path: str) -> str:
+    """Nests `path` under `key_prefix` when one is given -- see
+    config.EnvSecrets.r2_key_prefix's docstring for why a non-empty default
+    matters: it isolates a fresh run's objects from any earlier batch
+    already sitting in the bucket under the bare (unprefixed) paths."""
+    return f"{key_prefix}/{path}" if key_prefix else path
+
+
+def clip_key(podcast_id: str, episode_id: str, clip_id: str, key_prefix: str = "") -> str:
+    return _prefixed(key_prefix, f"clips/{podcast_id}/{episode_id}/{clip_id}.flac")
 
 
 def clip_url(bucket: str, key: str) -> str:
     return f"s3://{bucket}/{key}"
 
 
-def manifest_key(podcast_id: str | None = None) -> str:
-    return f"manifest/{podcast_id}.jsonl" if podcast_id else "manifest/manifest.jsonl"
+def manifest_key(podcast_id: str | None = None, key_prefix: str = "") -> str:
+    return _prefixed(key_prefix, f"manifest/{podcast_id}.jsonl" if podcast_id else "manifest/manifest.jsonl")
 
 
-def status_key(pod_id: str) -> str:
-    return f"status/{pod_id}.json"
+def status_key(pod_id: str, key_prefix: str = "") -> str:
+    return _prefixed(key_prefix, f"status/{pod_id}.json")
 
 
-def db_snapshot_key(pod_id: str) -> str:
-    return f"db_snapshots/{pod_id}/pipeline.db"
+def db_snapshot_key(pod_id: str, key_prefix: str = "") -> str:
+    return _prefixed(key_prefix, f"db_snapshots/{pod_id}/pipeline.db")
 
 
-def upload_clip(client, bucket: str, local_flac_path: str | Path, podcast_id: str, episode_id: str, clip_id: str) -> str:
+def log_key(pod_id: str, key_prefix: str = "") -> str:
+    return _prefixed(key_prefix, f"logs/{pod_id}.log")
+
+
+def upload_clip(
+    client, bucket: str, local_flac_path: str | Path, podcast_id: str, episode_id: str, clip_id: str, key_prefix: str = "",
+) -> str:
     """Uploads an already-encoded clip flac and returns the s3:// URL to
     persist as clips.audio_path -- the exact form the spec's manifest schema
     expects."""
-    key = clip_key(podcast_id, episode_id, clip_id)
+    key = clip_key(podcast_id, episode_id, clip_id, key_prefix)
     client.upload_file(str(local_flac_path), bucket, key)
     return clip_url(bucket, key)
 

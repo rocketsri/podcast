@@ -61,6 +61,7 @@ def build_env(
         "R2_ACCESS_KEY_ID": secrets.r2_access_key_id,
         "R2_SECRET_ACCESS_KEY": secrets.r2_secret_access_key,
         "R2_BUCKET_NAME": secrets.r2_bucket_name,
+        "R2_KEY_PREFIX": secrets.r2_key_prefix,
         "HF_TOKEN": secrets.hf_token,
         "NUM_PODS": str(num_pods),
     }

@@ -60,9 +60,9 @@ def parse_iso(ts: str) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def fetch_heartbeat(client, bucket: str, pod_id_label: str) -> dict | None:
+def fetch_heartbeat(client, bucket: str, pod_id_label: str, key_prefix: str = "") -> dict | None:
     try:
-        return storage.get_json(client, bucket, storage.status_key(pod_id_label))
+        return storage.get_json(client, bucket, storage.status_key(pod_id_label, key_prefix))
     except Exception:  # noqa: BLE001 - missing object, network blip, etc. -- just means "no heartbeat yet"
         return None
 
@@ -82,6 +82,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=None, help="path to pipeline.yaml (for monitoring.stale_heartbeat_minutes)")
     parser.add_argument("--pod-name-prefix", default="podcast-shard", help="only consider RunPod pods whose name starts with this")
+    parser.add_argument(
+        "--key-prefix", default=None,
+        help="R2 key namespace to read status/ heartbeats from (default: R2_KEY_PREFIX env var, see config.EnvSecrets.r2_key_prefix) -- must match what the pods being polled actually used",
+    )
     return parser.parse_args(argv)
 
 
@@ -95,6 +99,7 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("missing required environment variables: %s", ", ".join(missing))
         return 1
 
+    key_prefix = args.key_prefix if args.key_prefix is not None else secrets.r2_key_prefix
     runpod_client = RunPodClient(secrets.runpod_api_key)
     try:
         pods = [p for p in runpod_client.list_pods() if p.get("name", "").startswith(args.pod_name_prefix)]
@@ -115,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         pod_id_label = pod.get("name", "?")
         runpod_id = pod.get("id", "?")
         runpod_status = pod.get("desiredStatus") or pod.get("status") or "?"
-        hb = fetch_heartbeat(r2_client, secrets.r2_bucket_name, pod_id_label)
+        hb = fetch_heartbeat(r2_client, secrets.r2_bucket_name, pod_id_label, key_prefix)
         via_http = False
         if hb is None and runpod_id != "?":
             hb = fetch_heartbeat_via_http(runpod_id, cfg.monitoring.status_http_port)
