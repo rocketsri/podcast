@@ -1,5 +1,5 @@
 """Tests for pipeline/cluster.py: cross-episode speaker clustering, against
-a real in-memory sqlite db (db.connect(\":memory:\")). Synthetic embedding
+a real in-memory sqlite db (db.connect(":memory:")). Synthetic embedding
 vectors with known cluster structure -- two tight clusters of near-unit
 vectors with small noise, clearly separable by cosine distance at the
 default 0.75 match_threshold -- stand in for real pyannote/Resemblyzer
