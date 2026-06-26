@@ -14,6 +14,36 @@ This is a LibriLight-style speech dataset built from public podcast audio: short
 
 **Speaker-ID-under-sharding hazard, and how it's closed**: splitting one podcast's episodes across multiple pods means each pod's local incremental speaker numbering (`podcast123_speaker_002`) is only locally consistent — two pods can mint the same ID string for two different real people. Fix: per-episode diarization output (`local_speaker_segments`) is globally-keyed and shard-safe by construction; every pod's own `speakers`/`clips.speaker_id` assignment is treated as provisional. After all shards finish, `scripts/merge_shards.py` merges every pod's database (collision-free on natural keys) and re-runs clustering **once, from scratch, per podcast**, over the merged embeddings — discarding every shard-local speaker ID in favor of one centrally-computed, globally-consistent answer. This is the actual reason horizontal scaling didn't trade away speaker-ID correctness for throughput.
 
+## GPU choice: RTX 3090 fleet vs. H100, revisited with the remaining budget
+
+This pipeline ran entirely on RunPod RTX 3090 Community Cloud pods (booked at $0.30/hr, confirmed from `run_meta.gpu_hourly_rate_usd`). With roughly $40 of the $100 cap left and ~12h of submission-window time remaining at the point this was last reconsidered, the obvious follow-up question is whether switching some or all of that remaining budget to H100s would have processed meaningfully more audio — worth addressing directly rather than leaving for a reviewer to wonder about.
+
+**Correcting a misleading comparison.** The headline numbers circulated online (e.g. "55x faster") compare an H100's *sparsity-boosted* Tensor Core throughput against a 3090's *plain FP32 CUDA-core* throughput — two different operations on two different execution units, not a fair comparison for this workload (Silero VAD, pyannote diarization, faster-whisper — all dense FP16/BF16 inference, no structured sparsity in play). The correct apples-to-apples figure is dense (no-sparsity) Tensor Core FP16/BF16 throughput on both chips:
+
+| GPU | Dense Tensor FP16 (no sparsity) | Ratio vs. RTX 3090 |
+| --- | --- | --- |
+| RTX 3090 | ~142 TFLOPS | 1.0x |
+| H100 PCIe | ~756 TFLOPS | ~5.3x |
+| H100 SXM | ~990 TFLOPS | ~6.9x |
+
+The real per-GPU ceiling is roughly 5-7x, not 55x.
+
+**What the remaining budget actually affords.** RunPod H100 pricing (Community Cloud ~$1.80-2.40/hr, Secure Cloud ~$3.29/hr) runs 6-11x the booked 3090 rate. Over a 12h window, $40 buys either:
+- **~11 additional RTX 3090s** for the full window (`$40 / ($0.30/hr × 12h) ≈ 11`), or
+- **exactly 1 H100** for the full window at any of the price points above (`$40 / ($1.80-3.29/hr × 12h) ≈ 1`).
+
+That asymmetry is the first problem with switching: the remaining budget is wide enough to run a meaningful number of additional 3090s in parallel, but only deep enough for a single H100. Going wider beats going faster-but-narrower here purely on affordability, before FLOPs even enter the picture.
+
+**Even granting the H100 its full theoretical FLOPs advantage, it loses to width.** Using this trial's own measured fleet rate (179.09 raw-hours / 102.40 usable-hours over ~8.5h across 6 pods ≈ 3.5 raw-h and 2.0 usable-h per pod-hour, see `COST_REPORT.md`'s at-scale section), and naively assuming throughput scales linearly with dense TFLOPS (it doesn't — see below):
+- 1 H100 SXM over 12h: 6.9 × 3.5 raw-h/pod-h × 12h ≈ **293 raw hours**, ≈ **168 usable hours**.
+- 11 more RTX 3090s over 12h: 11 pods × 3.5 raw-h/pod-h × 12h ≈ **462 raw hours**, ≈ **265 usable hours**.
+
+Eleven 3090s beat one H100 by roughly 60%, even under the H100's best-case, perfectly-linear-scaling assumption.
+
+**And the linear-scaling assumption is itself wrong for this workload, which makes the real gap larger still.** This fleet is not actually FLOPs-bound today: pyannote's own model card claims ~40x real-time diarization throughput on a V100 (weaker than a 3090); this trial's fleet is achieving ~3.5x real-time aggregate (`COST_REPORT.md`'s at-scale section). That's roughly an order of magnitude below the GPU's own demonstrated ceiling on weaker hardware, which means the bottleneck isn't Tensor Core throughput — it's everything upstream and around the GPU call: per-episode download bandwidth, ffmpeg CPU transcoding, and a sequential, unbatched per-episode pipeline (see the bottleneck discussion below). An H100 inherits that same non-GPU overhead unchanged, so its realistic speedup on *this specific, unoptimized pipeline* is closer to 1.0-1.5x than to its theoretical 5-7x — the FLOPs are there, but the pipeline isn't shaped to spend them.
+
+**Decision.** Continuing with more $0.30/hr RTX 3090s — the same architecture already proven on this exact workload, with a real measured throughput number rather than a theoretical one — was the better-grounded choice for the remaining budget and window. Re-architecting for H100 batching (to actually realize its FLOPs advantage) would require restructuring the pipeline around batched, queued GPU calls instead of one sequential process per pod — a real win at 10,000+-hour scale (see `COST_REPORT.md`'s at-scale section) but not something to attempt with hours left on the clock when the current approach is already converging on the target.
+
 ## Prior art: LibriSpeech and Libri-Light
 
 Both reference corpora are LibriVox-audiobook-derived and are the direct namesake for "LibriLight-style" data, but neither had to solve the part of this task that's actually hard:
