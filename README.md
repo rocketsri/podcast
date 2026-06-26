@@ -23,7 +23,13 @@ Background design document (research, prior-art grounding, full architecture rat
 
 ## Processed dataset output (R2)
 
-Cloudflare R2, bucket `podcast`, all objects namespaced under key prefix `v2/`. This is a **private bucket** — access requires R2 credentials (see Setup below), not a public URL.
+Cloudflare R2, bucket `podcast`, all objects namespaced under key prefix `v2/`. The bucket's S3 API remains private (R2 credentials required, see Setup below), but every object is also reachable read-only over plain HTTPS via a public Cloudflare Worker:
+
+**Public base URL**: `https://podcast-dataset-public.podcast-dataset-rocketsri.workers.dev/<key>`
+
+e.g. the live manifest is `https://podcast-dataset-public.podcast-dataset-rocketsri.workers.dev/v2/manifest/manifest.jsonl`, and a clip is `.../v2/clips/<podcast_id>/<episode_id>/<clip_id>.flac`. GET/HEAD only, supports byte-range requests (for streaming/seeking audio clients) and CORS (`access-control-allow-origin: *`). Worker source: `infra/r2_public_worker/worker.js`; deploy config: `infra/r2_public_worker/wrangler.toml`.
+
+This exposes the **whole bucket**, not just the dataset-relevant prefixes below — a deliberate scope choice (simplest, matches the standard R2-public-read Worker pattern) over building custom per-prefix access control. None of the exposed objects contain secrets (credentials only ever lived in `.env`/RunPod env injection, never uploaded), but `db_snapshots/`/`logs/`/`status/` are internal operational artifacts, not part of the intended dataset deliverable — readers should treat `clips/` + `manifest/` as the actual data product.
 
 | Content | Key pattern |
 | --- | --- |
