@@ -32,7 +32,7 @@ from pathlib import Path
 
 import numpy as np
 
-from pipeline import audio, cluster, costs, db, diarize, heartbeat, ingest, segment, storage, vad
+from pipeline import audio, cluster, costs, db, diarize, heartbeat, ingest, logging_utils, segment, storage, vad
 from pipeline import asr as asr_module
 from pipeline import quality as quality_module
 
@@ -58,6 +58,9 @@ class RunContext:
     shard_id: int | None = None
     latest_status: dict = field(default_factory=dict)
     diarize_fn: object = None  # (audio_path, pipeline, min_local_speaker_seconds_for_embedding) -> diarize.DiarizationResult; defaults to diarize.diarize
+    db_path: str | Path | None = None  # local sqlite file backing `conn` -- needed to snapshot it to R2 (see _snapshot_db_to_r2)
+    log_path: str | Path | None = None  # local log file backing logging_utils.configure_logging -- needed to sync it to R2 (see _sync_log_to_r2)
+    num_pods: int = 1  # this run's total pod count, for dividing cost.budget_cap_usd fairly (see costs.per_pod_budget_cap_usd)
 
 
 class StageFailure(RuntimeError):
@@ -365,6 +368,33 @@ def _record_gpu_compute_checkpoint(ctx: RunContext, pod_started_at: datetime.dat
     db.set_run_meta(ctx.conn, "last_cost_checkpoint_at", now.isoformat())
 
 
+def _snapshot_db_to_r2(ctx: RunContext) -> None:
+    """Uploads this pod's local SQLite db to R2 so its relational metadata
+    (speakers, transcripts, quality flags, timestamps -- everything except
+    the clip audio bytes, which upload separately in
+    _ensure_exported_and_uploaded) survives a pod stop/terminate. RunPod
+    container disk is not guaranteed durable, unlike the bucket. WAL
+    checkpoint first so the uploaded file reflects all committed writes, not
+    just whatever made it into the base file before the last natural
+    checkpoint."""
+    if ctx.storage_client is None or ctx.bucket is None or ctx.db_path is None:
+        return
+    try:
+        ctx.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        storage.upload_file(ctx.storage_client, ctx.bucket, ctx.db_path, storage.db_snapshot_key(ctx.pod_id))
+    except Exception:
+        logger.exception("db snapshot upload to R2 failed -- continuing (next checkpoint will retry)")
+
+
+def _sync_log_to_r2(ctx: RunContext) -> None:
+    if ctx.storage_client is None or ctx.bucket is None or ctx.log_path is None:
+        return
+    try:
+        logging_utils.sync_log_to_r2(ctx.storage_client, ctx.bucket, ctx.pod_id, ctx.log_path)
+    except Exception:
+        logger.exception("log sync to R2 failed -- continuing")
+
+
 def _push_heartbeat(ctx: RunContext) -> None:
     pod_started_at = db.get_run_meta(ctx.conn, "pod_started_at", db.now_iso())
     status = heartbeat.build_status(ctx.conn, ctx.pod_id, ctx.shard_id, pod_started_at)
@@ -406,6 +436,8 @@ def run_queue(ctx: RunContext, shard: int | None = None, max_episodes: int | Non
     # loaded". Push one right away so pod restart/startup is visible
     # immediately.
     _push_heartbeat(ctx)
+    _snapshot_db_to_r2(ctx)
+    _sync_log_to_r2(ctx)
 
     episodes = list(db.list_failed_episodes(ctx.conn, shard=shard)) + list(db.list_queued_episodes(ctx.conn, shard=shard))
     if max_episodes is not None:
@@ -421,7 +453,7 @@ def run_queue(ctx: RunContext, shard: int | None = None, max_episodes: int | Non
             break
 
         avg_cost_per_episode = (db.total_cost(ctx.conn) / processed) if processed else 0.0
-        if costs.should_stop_for_budget(ctx.conn, avg_cost_per_episode, ctx.cfg.cost):
+        if costs.should_stop_for_budget(ctx.conn, avg_cost_per_episode, ctx.cfg.cost, pod_count=ctx.num_pods):
             logger.warning("budget cap reached ($%.2f spent) -- stopping before episode %s", db.total_cost(ctx.conn), episode_row["episode_id"])
             break
 
@@ -432,5 +464,7 @@ def run_queue(ctx: RunContext, shard: int | None = None, max_episodes: int | Non
 
         _record_gpu_compute_checkpoint(ctx, pod_started_at)
         _push_heartbeat(ctx)
+        _snapshot_db_to_r2(ctx)
+        _sync_log_to_r2(ctx)
 
     return {"processed": processed, "succeeded": succeeded, "failed": failed, "total_episodes_claimed": len(episodes)}

@@ -155,9 +155,10 @@ def per_pod_budget_cap_usd(global_cap_usd: float, pod_count: int) -> float:
     return global_cap_usd / max(pod_count, 1)
 
 
-def should_stop_for_budget(conn: sqlite3.Connection, projected_next_cost_usd: float, cfg) -> bool:
+def should_stop_for_budget(conn: sqlite3.Connection, projected_next_cost_usd: float, cfg, pod_count: int = 1) -> bool:
+    cap = per_pod_budget_cap_usd(cfg.budget_cap_usd, pod_count)
     projected_total = db.total_cost(conn) + projected_next_cost_usd
-    return projected_total > cfg.budget_cap_usd * cfg.budget_soft_stop_fraction
+    return projected_total > cap * cfg.budget_soft_stop_fraction
 
 
 def should_stop_for_time(elapsed_hours: float, projected_next_hours: float, cfg) -> bool:
