@@ -62,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
         # that's the only way a code fix reaches a live pod here). Cheap
         # no-op when there's nothing stale: only clips already flagged
         # uploaded=1 with a local file still on disk are even considered.
-        result = backfill.backfill_uploaded_clips(conn, storage_client, bucket)
+        result = backfill.backfill_uploaded_clips(conn, storage_client, bucket, key_prefix=secrets.r2_key_prefix)
         if result.candidates:
             logger.info(
                 "startup backfill: %d candidate(s) checked, %d already in R2, %d re-uploaded, %d failed, %d unrecoverable (file gone)",
@@ -75,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
     ctx = pipeline_runner.RunContext(
         conn=conn, cfg=cfg, models=models, work_dir=Path(args.work_dir),
         storage_client=storage_client, bucket=bucket, pod_id=args.pod_id, shard_id=args.shard,
-        db_path=args.db, log_path=args.log_path, num_pods=secrets.num_pods,
+        db_path=args.db, log_path=args.log_path, num_pods=secrets.num_pods, r2_key_prefix=secrets.r2_key_prefix,
     )
 
     status_port = args.status_port if args.status_port is not None else cfg.monitoring.status_http_port

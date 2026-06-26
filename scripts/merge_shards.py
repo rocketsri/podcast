@@ -80,19 +80,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", default=None, help="path to pipeline.yaml")
     parser.add_argument("--force", action="store_true", help="overwrite --output-db if it already exists")
     parser.add_argument("--no-upload-manifest", action="store_true", help="skip uploading the merged manifest.jsonl to R2 (manifest/manifest.jsonl)")
+    parser.add_argument(
+        "--key-prefix", default=None,
+        help="R2 key namespace to read db_snapshots from / write the manifest under (default: R2_KEY_PREFIX env var, see config.EnvSecrets.r2_key_prefix) -- must match what the pods being merged actually used",
+    )
     return parser.parse_args(argv)
 
 
-def _discover_pod_ids(client, bucket: str) -> list[str]:
-    keys = storage.list_keys(client, bucket, prefix="db_snapshots/")
-    return sorted({key.split("/")[1] for key in keys if key.endswith("/pipeline.db")})
+def _discover_pod_ids(client, bucket: str, key_prefix: str = "") -> list[str]:
+    prefix = f"{key_prefix}/db_snapshots/" if key_prefix else "db_snapshots/"
+    keys = storage.list_keys(client, bucket, prefix=prefix)
+    pod_id_part = 2 if key_prefix else 1  # "<key_prefix>/db_snapshots/<pod_id>/pipeline.db" vs "db_snapshots/<pod_id>/pipeline.db"
+    return sorted({key.split("/")[pod_id_part] for key in keys if key.endswith("/pipeline.db")})
 
 
-def _download_snapshots(client, bucket: str, pod_ids: list[str], download_dir: Path) -> list[tuple[str, Path]]:
+def _download_snapshots(client, bucket: str, pod_ids: list[str], download_dir: Path, key_prefix: str = "") -> list[tuple[str, Path]]:
     out = []
     for pod_id in pod_ids:
         dest = download_dir / pod_id / "pipeline.db"
-        storage.download_file(client, bucket, storage.db_snapshot_key(pod_id), dest)
+        storage.download_file(client, bucket, storage.db_snapshot_key(pod_id, key_prefix), dest)
         out.append((pod_id, dest))
         logger.info("downloaded %s snapshot -> %s", pod_id, dest)
     return out
@@ -213,9 +219,11 @@ def main(argv: list[str] | None = None) -> int:
 
     shard_sources: list[tuple[str, Path]] = [(f"local:{Path(p).stem}", Path(p)) for p in (args.local_db or [])]
 
+    secrets = config.EnvSecrets.from_env()
+    key_prefix = args.key_prefix if args.key_prefix is not None else secrets.r2_key_prefix
+
     pod_ids = list(args.pod_id or [])
     if args.auto_discover or pod_ids:
-        secrets = config.EnvSecrets.from_env()
         try:
             secrets.require_r2()
         except config.ConfigError as exc:
@@ -223,10 +231,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         client = storage.build_client(secrets)
         if args.auto_discover:
-            discovered = _discover_pod_ids(client, secrets.r2_bucket_name)
-            logger.info("auto-discovered %d pod snapshot(s) in R2: %s", len(discovered), discovered)
+            discovered = _discover_pod_ids(client, secrets.r2_bucket_name, key_prefix)
+            logger.info("auto-discovered %d pod snapshot(s) in R2 under prefix %r: %s", len(discovered), key_prefix, discovered)
             pod_ids = sorted(set(pod_ids) | set(discovered))
-        shard_sources.extend(_download_snapshots(client, secrets.r2_bucket_name, pod_ids, Path(args.download_dir)))
+        shard_sources.extend(_download_snapshots(client, secrets.r2_bucket_name, pod_ids, Path(args.download_dir), key_prefix))
 
     if not shard_sources:
         logger.error("no shard databases to merge -- pass --pod-id, --auto-discover, and/or --local-db")
@@ -261,12 +269,11 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("wrote %d manifest rows to %s", manifest_count, manifest_out)
 
     if not args.no_upload_manifest:
-        secrets = config.EnvSecrets.from_env()
         try:
             secrets.require_r2()
             client = storage.build_client(secrets)
-            storage.upload_file(client, secrets.r2_bucket_name, manifest_out, storage.manifest_key())
-            logger.info("uploaded manifest to R2 at %s", storage.manifest_key())
+            storage.upload_file(client, secrets.r2_bucket_name, manifest_out, storage.manifest_key(key_prefix=key_prefix))
+            logger.info("uploaded manifest to R2 at %s", storage.manifest_key(key_prefix=key_prefix))
         except config.ConfigError as exc:
             logger.warning("R2 credentials incomplete (%s) -- manifest stays local-only", exc)
 
