@@ -34,7 +34,13 @@ def build_client(secrets: config.EnvSecrets):
         aws_access_key_id=secrets.r2_access_key_id,
         aws_secret_access_key=secrets.r2_secret_access_key,
         region_name="auto",
-        config=BotoConfig(retries={"max_attempts": 4, "mode": "standard"}),
+        # max_attempts=4 was enough in the single-pod trial but under-budgeted
+        # for 6 pods writing concurrently -- observed live as real episode
+        # failures ("ServiceUnavailable: Reduce your concurrent request rate"
+        # / "429 Too Many Requests") once the full fleet was running. Standard
+        # mode already does exponential backoff with jitter; just give it more
+        # attempts to ride out fleet-scale throttling.
+        config=BotoConfig(retries={"max_attempts": 8, "mode": "standard"}),
     )
 
 
