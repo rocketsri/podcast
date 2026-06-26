@@ -2,7 +2,7 @@
 
 Converts public podcast audio into a LibriLight-style speech dataset: short, clean, single-speaker FLAC clips with persistent cross-episode speaker IDs and a full JSONL manifest. Built for the DataOps take-home (`FILE_3000.pdf`).
 
-**Status at submission**: 102.40 usable hours delivered (693 episodes, 104,983 clean clips, 58 podcasts) for $16.02 of infra spend — 16% of the $100 budget — with 6 RunPod pods actively converging on roughly 385 usable hours within the next few hours. All numbers below are a live snapshot; rerun `scripts/report.py` against a fresh merge for the current state.
+**Status at submission**: 124.60 usable hours delivered (693 episodes, 126,625 clean clips, 58 podcasts) for $18.87 of infra spend — 18.9% of the $100 budget — with 6 RunPod pods actively converging on roughly 408 usable hours within the next few hours. All numbers below are a live snapshot; rerun `scripts/report.py` against a fresh merge for the current state.
 
 ## Deliverables index
 
@@ -11,7 +11,7 @@ Converts public podcast audio into a LibriLight-style speech dataset: short, cle
 | 1 | Approach/tradeoffs writeup | [`WRITEUP.md`](WRITEUP.md) |
 | 2 | Processed dataset output | R2 bucket, see below |
 | 3 | Processing code | this repo |
-| 4 | Sample metadata manifest | [`manifest_sample.jsonl`](manifest_sample.jsonl) (60 rows, `random.seed(42)` sample of the live 104,983-row manifest) |
+| 4 | Sample metadata manifest | [`manifest_sample.jsonl`](manifest_sample.jsonl) (60 rows, `random.seed(42)` sample of the live 126,625-row manifest) |
 | 5 | Processing summary (raw/usable hours, clip count, yield, duration distribution, discard reasons) | [`PROCESSING_SUMMARY.md`](PROCESSING_SUMMARY.md) |
 | 6 | Trial-run cost breakdown | [`COST_REPORT.md`](COST_REPORT.md) |
 | 7 | At-scale cost estimate | [`COST_REPORT.md`](COST_REPORT.md) (At-scale estimate section) |
