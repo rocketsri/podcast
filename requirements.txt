@@ -8,12 +8,19 @@ numpy==1.26.4
 soundfile==0.12.1
 
 # VAD
-torch>=2.5.1
-torchaudio>=2.5.1
+torch==2.5.1
+torchaudio==2.5.1
 silero-vad==6.2.1
 
 # Diarization / speaker embeddings
 pyannote.audio==3.3.2
+# pyannote.audio 3.3.2 calls hf_hub_download(..., use_auth_token=...) internally;
+# huggingface_hub removed that kwarg in a later release -- pin below the removal.
+huggingface_hub==0.25.2
+# The RunPod base image (runpod/pytorch:1.0.7-cu1281-torch271-ubuntu2204) sets
+# HF_HUB_ENABLE_HF_TRANSFER=1 by default; huggingface_hub raises ValueError on
+# every download unless this accelerator package is actually installed.
+hf_transfer==0.1.9
 
 # ASR (quality-filter signal + optional transcript)
 faster-whisper==1.1.1

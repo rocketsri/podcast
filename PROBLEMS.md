@@ -249,3 +249,390 @@ same selected episode set, but pods claim their shortest known episodes
 first. This only takes effect for a queue fetched after this change (i.e.
 a fresh `run_pipeline.py` start), so applying it to already-running pods
 requires relaunching them.
+
+## 12. All 6 relaunched pods crash-looped for 20+ minutes, burning money with zero output
+
+**Problem.** After the #10/#11 relaunch, all 6 pods sat at 0% GPU, 0% CPU,
+and zero R2 objects for 20-35 minutes -- looked at first like a slow but
+healthy boot (heavy `pyannote.audio` pip install, model download,
+discovery). Pulling `podcast-shard-5`'s actual container logs (RunPod
+GraphQL/REST expose no log endpoint we have access to, so this required
+the user to paste them in manually) showed something much worse: the pod
+was not slowly booting, it was crash-restarting every ~16 seconds, in a
+loop with no exit condition, the entire time.
+
+**Root cause, two compounding bugs.** (1) `infra/bootstrap.sh` ran bare
+`pip install --quiet -r requirements.txt`, which returned in well under
+15 seconds total (clone + cd + install + mkdir combined) -- far too fast
+to have actually installed `pyannote.audio`'s real dependency tree. It
+resolved to a different interpreter/environment than the `python3` used
+to run `select_podcasts_free.py` immediately after, so `import yaml`
+(requirements.txt's first package) raised `ModuleNotFoundError` and the
+script exited nonzero under `set -euo pipefail`. (2) This is itself just
+one crash -- the part that made it unrecoverable was that RunPod restarts
+this container's entrypoint automatically on exit (directly observed:
+~16s between identical log cycles, for 20+ minutes straight). That
+contradicts what problem #10 assumed ("RunPod doesn't restart a container
+whose process exited") -- it does, at least for this pod/image
+configuration. Once bug #1 crashed the container the first time, every
+subsequent restart's `git clone` failed immediately too
+(`destination path '/workspace/podcast' already exists and is not an
+empty directory`, since the leftover directory from the first attempt was
+never cleaned up), permanently locking the pod into a loop that could
+never get past the clone step again -- regardless of whether the original
+pip/yaml bug would have eventually self-resolved.
+
+**Fix.** `infra/bootstrap.sh`: (a) made the clone step idempotent --
+if `$WORKDIR/.git` already exists (an earlier attempt in the same
+container), `git fetch` + `reset --hard` in place instead of failing;
+(b) replaced the bare `pip install` with `python3 -m pip install` so
+the install target is guaranteed to be the same interpreter every later
+step uses; (c) added a fail-fast `python3 -c "import yaml, torch,
+pyannote.audio, faster_whisper"` check immediately after install that
+exits with a clear `[bootstrap] FATAL` message instead of letting a
+missing dependency surface 20+ lines deep in `select_podcasts_free.py`'s
+traceback. Problem #10's "RunPod doesn't restart a container whose
+process exited" is left as-is below (historical record of what was
+believed at the time), but this entry supersedes it: assume RunPod
+**will** retry a crashed container's entrypoint, which makes idempotent
+boot steps a correctness requirement, not a nice-to-have.
+
+**Cost impact.** All 6 pods ran in this useless loop for the entire
+20-35 minute window between the #10/#11 relaunch and this fix --
+6 pods x ~0.5h x ~$0.30/hr is small in absolute dollars, but 100% of it
+produced zero usable output, and the same bug would have silently
+repeated on every future relaunch until logs were manually pulled and
+read by a human, since no telemetry channel available to this session
+(GraphQL runtime stats, R2 heartbeat) can distinguish a crash loop from a
+slow-but-healthy boot.
+
+## 13. One pod landed on a RunPod host with an incompatible GPU driver -- a hardware issue, not a code bug
+
+**Problem.** After the #12 fix was deployed to all 6 relaunched pods,
+direct RunPod GraphQL polling showed `podcast-shard-5` flat at exactly 0%
+CPU and 0% GPU across multiple polls 30+ seconds apart, with zero monitor
+notifications since launch -- while shards 0-4 all showed at least brief
+CPU activity in the same window. The user independently corroborated this
+from the RunPod console: shard-5 showed 0% disk used, while shards 0-4
+were at 29-36%. This looked at first like it could be a recurrence of
+#12, so the pod was restarted (RunPod REST `POST /pods/{id}/restart`) as
+a low-cost first attempt.
+
+**Root cause.** The restart did not help, and the user pulled shard-5's
+actual container logs, which showed the real cause: the container never
+started at all, at the Docker/OCI level, before `infra/bootstrap.sh` (or
+any application code) ever ran:
+```
+error starting container: ... OCI runtime create failed: runc create
+failed: ... nvidia-container-cli: requirement error: unsatisfied
+condition: cuda>=12.8, please update your driver to a newer version, or
+use an earlier cuda container: unknown
+```
+The `runpod/pytorch:1.0.7-cu1281-torch271-ubuntu2204` image requires
+CUDA >= 12.8, but the specific physical host this pod was scheduled onto
+(RunPod Community Cloud, `machineId x3fo8pyehccc`) had an older NVIDIA
+driver that doesn't satisfy that. Docker retried container creation
+every ~16 seconds, continuously, from pod creation through at least 13+
+minutes later with zero self-recovery -- explaining the flat 0%
+CPU/GPU/disk: there was never a running process to measure. This is a
+**host/hardware incompatibility**, entirely outside this repo's code --
+no edit to `infra/bootstrap.sh`, `requirements.txt`, or anything else
+in-repo could have prevented or fixed it. It is also why the restart
+didn't help: restarting a pod via the RunPod API keeps it pinned to the
+same physical machine, and the machine's driver was the broken part.
+
+**Fix.** Terminated the affected pod and created a brand new one in its
+place with the same shard config (`bootstrap_pod.py --num-pods 1
+--shard-offset 5 --confirm`) so RunPod would schedule it onto a
+different host. Confirmed via GraphQL (`machineId`) that the new pod
+landed on a different machine than the broken one before considering it
+resolved.
+
+**Takeaway.** Community Cloud hosts are operator-owned and can have
+stale drivers; a single bad host is a real, if infrequent, possibility
+and looks identical from the outside to a slow-but-healthy boot (zero
+CPU/GPU/disk activity, no logs reaching any telemetry channel this
+session has API access to) until real container logs are pulled. The
+diagnostic signature that distinguished it from #12: *zero* lines ever
+appear in the container's logs at all (not even the first `[bootstrap]`
+echo), because the failure is at container creation, a layer below
+where `bootstrap.sh` runs.
+
+## 14. Relaxed torch/torchaudio pins let pip drift to versions pyannote.audio can't import
+
+**Problem.** After the #13 host-migration fix, shards 0-4 (all relaunched
+with the #12 fix) looked idle from telemetry alone -- near-zero/negative
+`uptimeInSeconds`, 0% GPU, no R2 heartbeats -- but the user flagged that
+the RunPod console showed them visibly restarting on a loop. The Docker
+engine-event log (system log) for shard-4 showed a clean image pull, one
+successful container start, ~2.5 minutes of activity, then an unbroken
+`start container ... begin` loop every ~16s for 10.5+ minutes with **no
+error line at all** -- a third pattern, distinct from both #12 (app bug,
+full traceback visible in that same log) and #13 (host driver, explicit
+`nvidia-container-cli` error every cycle). The engine-event log doesn't
+carry the container's own stdout, so the actual cause was invisible until
+the user pulled the separate **application/container log** (a different
+tab in the RunPod console).
+
+**Root cause.** That log showed `bootstrap.sh` itself failing, every
+cycle, at its own fail-fast guard from the #12 fix:
+```
+File ".../pyannote/audio/core/io.py", line 60, in <module>
+    ) -> torchaudio.AudioMetaData:
+AttributeError: module 'torchaudio' has no attribute 'AudioMetaData'
+[bootstrap] FATAL: core deps not importable after install -- aborting
+```
+`requirements.txt` pinned `torch>=2.5.1` / `torchaudio>=2.5.1` (relaxed
+from exact `==2.5.1` pins in the #13-adjacent multi-pod-scale-out commit,
+specifically so pip would treat the RunPod image's preinstalled torch
+2.7.1 as already-satisfied and skip a slow reinstall). In practice pip's
+resolver did not stop at the preinstalled version -- the install log shows
+it pulled `torch-2.12.1` and `torchaudio-2.11.0`, both far newer than
+`pyannote.audio==3.3.2` was built against. `pyannote.audio` declares no
+upper bound on torch/torchaudio in its own package metadata, so pip
+happily resolves the combination; the incompatibility only surfaces at
+*import time*, as an `AttributeError` on an API pyannote's code still
+expects. Because `bootstrap.sh` reinstalls `requirements.txt`
+unconditionally on every restart (not just once per container), every
+single restart hit the same resolution and the same import failure,
+forever -- explaining the all-zero telemetry (the failure is in
+`bootstrap.sh`, well before `run_pipeline.py` and its status server ever
+start) with no Docker-level error (the container itself starts and runs
+fine; it's the application script that deliberately `exit 1`s).
+
+**Fix.** Reverted `requirements.txt` to the exact pins proven to work
+before the relaxation: `torch==2.5.1` / `torchaudio==2.5.1`. No pod
+restart/terminate was needed -- `bootstrap.sh` already re-clones the
+branch HEAD on every restart, so the already-looping pods pick up the fix
+on their next automatic cycle.
+
+**Takeaway.** An unbounded `>=` pin on a fast-moving package (torch) is
+not equivalent to "prefer the preinstalled version" -- pip's resolver can
+and did drift to the newest release on PyPI instead, several minor
+versions past what a pinned, less-actively-maintained dependency
+(`pyannote.audio==3.3.2`) was validated against. A correctness-critical
+transitive dependency like this needs an explicit pin (or at least an
+upper bound), not just a floor; the "skip a slow reinstall" optimization
+that motivated the floor-only pin should have been scoped with an upper
+bound from the start. The diagnostic signature that distinguished this
+from #12 and #13: the Docker/system log alone showed a clean restart loop
+with *no* error text anywhere -- only the separate application-log tab
+revealed the actual Python traceback and the deliberate `bootstrap.sh`
+abort.
+
+## 15. Same class of bug, one dependency deeper: unpinned huggingface_hub broke pyannote's own hf_hub_download call
+
+**Problem.** Right after the #14 fix shipped, shard-4's restart loop
+changed shape but didn't stop: `bootstrap.sh` now passed its import check
+("`[bootstrap] python deps OK`") and `run_pipeline.py` actually started
+for the first time -- progress -- but it then crashed within ~2 seconds,
+every cycle:
+```
+File ".../pyannote/audio/core/pipeline.py", line 90, in from_pretrained
+    config_yml = hf_hub_download(...)
+File ".../huggingface_hub/utils/_validators.py", line 88, in _inner_fn
+    return fn(*args, **kwargs)
+TypeError: hf_hub_download() got an unexpected keyword argument 'use_auth_token'
+```
+
+**Root cause.** Identical mechanism to #14, one level further down the
+dependency tree: `requirements.txt` never pinned `huggingface_hub` at
+all, so pip resolved it to the newest release (`1.21.0`). `pyannote.audio`
+3.3.2's own internal code (`pipeline.py:90`) still calls
+`hf_hub_download(..., use_auth_token=hf_token)` -- an argument name
+`huggingface_hub` has since removed in favor of `token`. Pinning the
+direct dependencies (`torch`/`torchaudio`) wasn't enough; any transitive
+dependency pyannote.audio touches at runtime without us pinning it is
+just as free to drift to an incompatible newer release.
+
+**Fix.** Added an explicit `huggingface_hub==0.25.2` pin to
+`requirements.txt` (the last release before the `use_auth_token` removal).
+Verified locally first, without needing a GPU: installed
+`huggingface_hub==0.25.2` alone in a throwaway venv and called
+`hf_hub_download(..., use_auth_token=...)` against a fake repo -- it
+raised a normal `RepositoryNotFoundError`, not a `TypeError`, confirming
+the kwarg is still accepted. Then ran `pip install --dry-run -r
+requirements.txt` (with the new pin appended) and confirmed it resolves
+clean with no version conflicts and without disturbing the `torch==2.5.1`
+/ `torchaudio==2.5.1` pins from #14. No pod action needed, same reasoning
+as #14: the next automatic restart re-clones the branch and picks up the
+new pin.
+
+**Takeaway.** A library pinned to an exact version (`pyannote.audio==
+3.3.2`) is only as stable as *its own* unpinned dependencies -- pinning
+the direct, obviously-relevant package (torch) doesn't protect against
+every other transitive dependency it calls into at runtime. Worth
+auditing the rest of pyannote.audio's dependency tree the same way before
+assuming this class of bug is fully closed.
+
+## 16. Gated HF model access was never actually granted -- and smoke_test.py's own check gave a false "confirmed"
+
+**Problem.** Acting on "look for all possible problems like this and fix
+them," audited the rest of the model-loading chain locally (CPU venv,
+exact pinned `requirements.txt`, actually *calling* `vad.load_model()`,
+`diarize.load_pipeline()`, and `asr.load_model()` rather than just
+importing). `vad` and `asr` (faster-whisper/ctranslate2/tokenizers) both
+loaded and ran clean -- no further version-drift bugs there. `diarize`
+failed, but not with a version error:
+```
+GatedRepoError: 403 Client Error ... Cannot access gated repo for url
+https://huggingface.co/pyannote/speaker-diarization-3.1/resolve/main/config.yaml.
+Access to model pyannote/speaker-diarization-3.1 is restricted and you
+are not in the authorized list.
+```
+The same failure reproduces for `pyannote/segmentation-3.0`, the gated
+sub-model `Pipeline.from_pretrained()` loads internally for the
+segmentation step. Both confirmed with the exact `HF_TOKEN` from `.env`
+-- the same token every pod uses -- so every one of the 6 shards is
+blocked here regardless of the #14/#15 fixes.
+
+Worse: `scripts/smoke_test.py`'s `check_huggingface()` had already been
+run earlier in the project and reported `[OK] huggingface: token valid
+(user=rocketsri), gated model access confirmed` -- a false positive that
+likely gave false confidence before the pods were ever launched.
+
+**Root cause.** `check_huggingface()` validated gated access with
+`HfApi.model_info(GATED_MODEL_ID, token=...)`. `model_info()` only reads
+repo *metadata* (it returns fine even with `gated: "auto"` info) and does
+not enforce the per-user gate -- confirmed directly: `model_info()`
+succeeds with this exact token, but `hf_hub_download()` of an actual file
+from the same repo, with the same token, 403s. The gate is only enforced
+on real file fetches, which is exactly what `Pipeline.from_pretrained()`
+needs and what the smoke test should have exercised instead of a
+metadata-only call.
+
+**Fix.** Changed `check_huggingface()` to call `hf_hub_download(repo_id,
+"config.yaml", token=...)` against both gated repos actually used
+(`pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0`)
+instead of `model_info()`. Re-ran the smoke test: it now correctly
+reports `[FAIL] huggingface: token valid (user=rocketsri) but gated model
+access failed for pyannote/speaker-diarization-3.1 -- accept the license
+at https://huggingface.co/pyannote/speaker-diarization-3.1`.
+
+This part requires action from whoever holds the `rocketsri` HF account
+tied to `HF_TOKEN` -- visit and accept the user-conditions agreement
+(logged in as that account) on:
+  - https://huggingface.co/pyannote/speaker-diarization-3.1
+  - https://huggingface.co/pyannote/segmentation-3.0
+Both show `gated: "auto"`, meaning access is granted immediately on
+accepting, no manual repo-owner review wait. No code or pin can substitute
+for this step.
+
+**Takeaway.** A metadata-only HF API call (`model_info`,
+`list_repo_files`, etc.) is not a valid proxy for "can this token actually
+download this gated file" -- gated-repo enforcement in `huggingface_hub`
+0.25.2 only triggers on the real download path. Any future
+connectivity/smoke check for gated content should exercise the same call
+the real code makes, not a cheaper-looking substitute that happens to
+return 200/OK for an unrelated reason.
+
+## 17. RunPod base image sets HF_HUB_ENABLE_HF_TRANSFER=1; we never installed hf_transfer
+
+**Problem.** Right after the HF gated-license agreement was accepted
+(#16) and shards restarted past that blocker, a live shard hit a new
+crash immediately on the very same `hf_hub_download()` call:
+```
+ValueError: Fast download using 'hf_transfer' is enabled
+(HF_HUB_ENABLE_HF_TRANSFER=1) but 'hf_transfer' package is not available
+in your environment. Try `pip install hf_transfer`.
+```
+
+**Root cause.** Same family as #14 (base-image preinstalled state silently
+dropped by our own fresh `pip install -r requirements.txt`), one
+environment-variable layer instead of a package-pin layer this time: the
+RunPod base image (`runpod/pytorch:1.0.7-cu1281-torch271-ubuntu2204`,
+see `scripts/bootstrap_pod.py`'s `DEFAULT_IMAGE`) bakes in
+`HF_HUB_ENABLE_HF_TRANSFER=1` so HF downloads use the faster Rust-backed
+transfer path by default. `huggingface_hub` checks that env var on every
+download and raises `ValueError` (not a silent fallback) if the
+`hf_transfer` package isn't actually installed. `requirements.txt` never
+listed `hf_transfer`, so every single `hf_hub_download()` call -- the
+gated pipeline checkpoint, its segmentation/embedding sub-models, all of
+them -- was guaranteed to fail this way the moment the gated-access
+blocker (#16) was cleared.
+
+**Fix.** Added `hf_transfer==0.1.9` to `requirements.txt`. Verified
+locally first: installed it in the same audit venv, set
+`HF_HUB_ENABLE_HF_TRANSFER=1` to match the pod's actual environment, and
+called `hf_hub_download()` against the real gated repo with the real
+`HF_TOKEN` -- succeeded. `pip install --dry-run` with the pin appended
+showed no conflicts against the rest of the stack.
+
+**Takeaway.** The base-image-drift risk from #14 isn't limited to
+preinstalled *packages* -- it extends to preinstalled *environment
+variables* that silently assume a package will be present. Worth a final
+check of the rest of the RunPod base image's default env (`env | grep
+HF_\|TRANSFORMERS_\|TORCH_` on a fresh pod, not yet done) for any other
+opt-in-by-default behavior our minimal `requirements.txt` doesn't
+actually satisfy.
+
+## 18. R2 heartbeat never lands, even though the pipeline itself is healthy
+
+**Problem.** After #16/#17 were fixed and all 6 shards restarted, real
+episodes were processing correctly -- confirmed directly by curling each
+pod's exposed status HTTP port (`https://<runpod-id>-8080.proxy.runpod.net/`,
+the `ports=["8080/http"]` `scripts/bootstrap_pod.py` already opens but
+nothing in this repo had ever actually queried): all 6 shards showed real
+`done` episode counts and hundreds of uploaded clips each. But
+`scripts/poll_status.py` -- the only monitoring path anyone would normally
+use, since it reads the R2 heartbeat object -- reported "no heartbeat in
+R2 yet" for every shard the entire time. Confirmed directly with a
+throwaway script hitting R2 for `status/podcast-shard-{0..5}.json`: all
+six keys genuinely do not exist.
+
+**Root cause -- partially identified, not fully.** `_push_heartbeat()`
+(`pipeline/pipeline_runner.py`) wraps the R2 write
+(`heartbeat.push_status_to_r2`) in a bare `try/except Exception:
+logger.exception(...)`, so a failing write was silently swallowed with no
+trace anywhere reachable without pod log/SSH access (which this
+architecture doesn't have). Clip uploads use the identical
+`ctx.storage_client`/`ctx.bucket` pair and the identical non-None guard,
+and those succeed, so the credentials/client/bucket are not the problem.
+Reproducing the exact call (`storage.put_json` to the same `status/`
+prefix, same bucket, same credentials from `.env`) succeeded both against
+this sandbox's system boto3 (1.43.36) and -- to rule out a version-drift
+explanation matching #14/#17's pattern -- against a venv with the exact
+pinned `boto3==1.35.99`/`botocore==1.35.99` the pods actually run. Neither
+reproduces the failure, so whatever is actually throwing inside
+`push_status_to_r2` on the live pods is still unknown; this is a real gap
+in this entry, not a closed one.
+
+**Fix (so far).** Made the failure observable instead of guessing at a
+root cause with no evidence: `_push_heartbeat()` now stashes
+`f"{type(exc).__name__}: {exc}"` into the status dict itself under
+`heartbeat_r2_push_error` before assigning it to `ctx.latest_status`
+(moved the assignment to after the try/except). The local HTTP status
+channel was already being served from `ctx.latest_status` and is already
+reachable externally via the RunPod port-8080 proxy, so the next pod
+restart will surface the real exception there even though the R2 object
+that should have carried the same detail is exactly what's failing to
+write. Also moved the first `_push_heartbeat()` call to the top of
+`run_queue()`, before the episode loop: previously a heartbeat was only
+pushed *after* a full episode finished (download + VAD + diarize + ASR +
+export, easily 10-30+ minutes for a real episode), so for that entire
+window R2/poll_status.py couldn't distinguish "still working on episode
+1" from "crash-looped before models even loaded" -- both look identical
+(no heartbeat object, RunPod status RUNNING). Verified both changes with
+a standalone script: a `RunContext` with a storage client that always
+raises confirms `run_queue()` with zero queued episodes still pushes one
+heartbeat immediately and that the captured exception text lands in
+`ctx.latest_status["heartbeat_r2_push_error"]` without crashing the run.
+
+Did not restart the live pods to pick this up -- they're mid-run
+producing real clips successfully despite the broken heartbeat, and a
+restart (even though `run_queue` resumes failed/queued episodes rather
+than losing progress) is exactly the kind of pod-state-changing action
+that needs an explicit go-ahead rather than being done opportunistically
+while chasing a monitoring-only bug.
+
+**Takeaway.** A "redundant" fallback channel (the local HTTP status
+server, justified in `heartbeat.py`'s own docstring as insurance "since a
+status check shouldn't depend solely on R2 write success") is only
+actually redundant if something *reads* it. Nothing in this repo did --
+`poll_status.py` only ever checked R2 -- so the fallback's only practical
+value during this incident was that I happened to know the port was
+exposed and could curl it by hand. A bare `except Exception:
+logger.exception(...)` with no surfaced detail is functionally a silent
+failure in any environment without log access, regardless of intent;
+swallowed exceptions need to leave a trace somewhere a caller without
+shell access can actually see, not just in a log file nothing reads.

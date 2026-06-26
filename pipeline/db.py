@@ -299,6 +299,23 @@ def list_failed_episodes(conn: sqlite3.Connection, shard: int | None = None) -> 
     ).fetchall()
 
 
+def list_stalled_episodes(conn: sqlite3.Connection, shard: int | None = None) -> list[sqlite3.Row]:
+    """Episodes whose process was killed mid-stage (pod crash/restart, OOM,
+    SIGKILL) with no Python exception ever raised -- so mark_stage_failed
+    never ran and the episode is stuck at an arbitrary intermediate stage
+    that neither list_queued_episodes nor list_failed_episodes will match.
+    process_episode's per-stage skip-guards (is_at_or_past/resume_stage) are
+    already safe to resume from any of these stages; the gap was purely in
+    what run_queue claimed at startup."""
+    incomplete_stages = [s for s in EPISODE_STAGES if s not in ("queued", "done")]
+    placeholders = ",".join("?" for _ in incomplete_stages)
+    if shard is None:
+        query = f"SELECT * FROM episodes WHERE stage IN ({placeholders}) AND assigned_shard IS NULL ORDER BY episode_id"
+        return conn.execute(query, incomplete_stages).fetchall()
+    query = f"SELECT * FROM episodes WHERE stage IN ({placeholders}) AND assigned_shard = ? ORDER BY episode_id"
+    return conn.execute(query, (*incomplete_stages, shard)).fetchall()
+
+
 def set_assigned_shard(conn: sqlite3.Connection, episode_id: str, shard: int) -> None:
     conn.execute(
         "UPDATE episodes SET assigned_shard = ?, updated_at = ? WHERE episode_id = ?",

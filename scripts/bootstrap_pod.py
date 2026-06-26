@@ -50,7 +50,7 @@ DEFAULT_GIT_BRANCH = "claude/podcast-speech-builder-e0kfs5"
 
 def build_env(
     secrets: config.EnvSecrets, pod_id_label: str, shard_id: int,
-    git_repo_url: str, git_branch: str, github_token: str,
+    git_repo_url: str, git_branch: str, github_token: str, num_pods: int,
 ) -> dict[str, str]:
     env = {
         "POD_ID": pod_id_label,
@@ -62,6 +62,7 @@ def build_env(
         "R2_SECRET_ACCESS_KEY": secrets.r2_secret_access_key,
         "R2_BUCKET_NAME": secrets.r2_bucket_name,
         "HF_TOKEN": secrets.hf_token,
+        "NUM_PODS": str(num_pods),
     }
     if github_token:
         env["GITHUB_TOKEN"] = github_token
@@ -138,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
     for i in range(args.num_pods):
         shard_id = args.shard_offset + i
         pod_id_label = f"{args.pod_name_prefix}-{shard_id}"
-        env = build_env(secrets, pod_id_label, shard_id, args.git_repo_url, args.git_branch, args.github_token)
+        env = build_env(secrets, pod_id_label, shard_id, args.git_repo_url, args.git_branch, args.github_token, args.num_pods)
         try:
             result = client.create_pod(
                 name=pod_id_label,

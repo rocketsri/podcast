@@ -109,6 +109,14 @@ class RunPodClient:
     def start_pod(self, pod_id: str) -> dict:
         return self._request("POST", f"/pods/{pod_id}/start")
 
+    def restart_pod(self, pod_id: str) -> dict:
+        """Keeps the pod pinned to the same physical machine/disk, unlike
+        stop+start or terminate+create which can reschedule onto a different
+        host (confirmed in this project: PROBLEMS.md #13). The lowest-risk
+        way to redeploy fixed code onto a live pod without losing whatever
+        is only on its local container disk."""
+        return self._request("POST", f"/pods/{pod_id}/restart")
+
     def terminate_pod(self, pod_id: str) -> None:
         self._request("DELETE", f"/pods/{pod_id}")
 

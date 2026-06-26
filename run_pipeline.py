@@ -9,7 +9,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from pipeline import asr, config, db, diarize, heartbeat, logging_utils, pipeline_runner, storage, vad
+from pipeline import asr, backfill, config, db, diarize, heartbeat, logging_utils, pipeline_runner, storage, vad
 
 logger = logging_utils.get_logger()
 
@@ -50,11 +50,24 @@ def main(argv: list[str] | None = None) -> int:
     storage_client, bucket = None, None
     if not args.no_upload:
         try:
-            secrets.require_for_network_ops()
+            secrets.require_r2()
             storage_client = storage.build_client(secrets)
             bucket = secrets.r2_bucket_name
         except config.ConfigError as exc:
             logger.warning("R2 credentials incomplete (%s) -- running in local-only mode, clips stay on disk", exc)
+
+    if storage_client is not None and bucket is not None:
+        # Runs on every boot (including a plain restart_pod() of an
+        # already-running pod -- see pipeline/backfill.py's docstring for why
+        # that's the only way a code fix reaches a live pod here). Cheap
+        # no-op when there's nothing stale: only clips already flagged
+        # uploaded=1 with a local file still on disk are even considered.
+        result = backfill.backfill_uploaded_clips(conn, storage_client, bucket)
+        if result.candidates:
+            logger.info(
+                "startup backfill: %d candidate(s) checked, %d already in R2, %d re-uploaded, %d failed, %d unrecoverable (file gone)",
+                result.candidates, result.already_present, result.reuploaded, result.failed, result.missing,
+            )
 
     if db.get_run_meta(conn, "gpu_hourly_rate_usd") is None:
         db.set_run_meta(conn, "gpu_hourly_rate_usd", str(cfg.cost.assumed_gpu_hourly_usd))
@@ -62,6 +75,7 @@ def main(argv: list[str] | None = None) -> int:
     ctx = pipeline_runner.RunContext(
         conn=conn, cfg=cfg, models=models, work_dir=Path(args.work_dir),
         storage_client=storage_client, bucket=bucket, pod_id=args.pod_id, shard_id=args.shard,
+        db_path=args.db, log_path=args.log_path, num_pods=secrets.num_pods,
     )
 
     status_port = args.status_port if args.status_port is not None else cfg.monitoring.status_http_port

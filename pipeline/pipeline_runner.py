@@ -32,7 +32,7 @@ from pathlib import Path
 
 import numpy as np
 
-from pipeline import audio, cluster, costs, db, diarize, heartbeat, ingest, segment, storage, vad
+from pipeline import audio, cluster, costs, db, diarize, heartbeat, ingest, logging_utils, segment, storage, vad
 from pipeline import asr as asr_module
 from pipeline import quality as quality_module
 
@@ -58,6 +58,9 @@ class RunContext:
     shard_id: int | None = None
     latest_status: dict = field(default_factory=dict)
     diarize_fn: object = None  # (audio_path, pipeline, min_local_speaker_seconds_for_embedding) -> diarize.DiarizationResult; defaults to diarize.diarize
+    db_path: str | Path | None = None  # local sqlite file backing `conn` -- needed to snapshot it to R2 (see _snapshot_db_to_r2)
+    log_path: str | Path | None = None  # local log file backing logging_utils.configure_logging -- needed to sync it to R2 (see _sync_log_to_r2)
+    num_pods: int = 1  # this run's total pod count, for dividing cost.budget_cap_usd fairly (see costs.per_pod_budget_cap_usd)
 
 
 class StageFailure(RuntimeError):
@@ -292,6 +295,16 @@ def _ensure_exported_and_uploaded(ctx: RunContext, episode_row: sqlite3.Row) -> 
                 audio_path = storage.upload_clip(
                     ctx.storage_client, ctx.bucket, local_flac_path, podcast_id, episode_id, clip["clip_id"]
                 )
+                # upload_file() not raising is not sufficient evidence the bytes
+                # landed -- observed live on the RunPod fleet: every upload_file()
+                # call returned cleanly (and every heartbeat put_json() call too)
+                # while R2 stayed completely empty the whole run, almost certainly
+                # something on the pod's network path faking a 2xx instead of
+                # erroring. A real head_object check closes that gap before we
+                # trust the flag enough to ever delete the only copy.
+                key = storage.clip_key(podcast_id, episode_id, clip["clip_id"])
+                if not storage.object_exists(ctx.storage_client, ctx.bucket, key):
+                    raise RuntimeError(f"upload_file reported success for {key} but object_exists is False after")
                 uploaded_count += 1
             else:
                 audio_path = local_flac_path
@@ -365,24 +378,61 @@ def _record_gpu_compute_checkpoint(ctx: RunContext, pod_started_at: datetime.dat
     db.set_run_meta(ctx.conn, "last_cost_checkpoint_at", now.isoformat())
 
 
+def _snapshot_db_to_r2(ctx: RunContext) -> None:
+    """Uploads this pod's local SQLite db to R2 so its relational metadata
+    (speakers, transcripts, quality flags, timestamps -- everything except
+    the clip audio bytes, which upload separately in
+    _ensure_exported_and_uploaded) survives a pod stop/terminate. RunPod
+    container disk is not guaranteed durable, unlike the bucket. WAL
+    checkpoint first so the uploaded file reflects all committed writes, not
+    just whatever made it into the base file before the last natural
+    checkpoint."""
+    if ctx.storage_client is None or ctx.bucket is None or ctx.db_path is None:
+        return
+    try:
+        ctx.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        storage.upload_file(ctx.storage_client, ctx.bucket, ctx.db_path, storage.db_snapshot_key(ctx.pod_id))
+    except Exception:
+        logger.exception("db snapshot upload to R2 failed -- continuing (next checkpoint will retry)")
+
+
+def _sync_log_to_r2(ctx: RunContext) -> None:
+    if ctx.storage_client is None or ctx.bucket is None or ctx.log_path is None:
+        return
+    try:
+        logging_utils.sync_log_to_r2(ctx.storage_client, ctx.bucket, ctx.pod_id, ctx.log_path)
+    except Exception:
+        logger.exception("log sync to R2 failed -- continuing")
+
+
 def _push_heartbeat(ctx: RunContext) -> None:
     pod_started_at = db.get_run_meta(ctx.conn, "pod_started_at", db.now_iso())
     status = heartbeat.build_status(ctx.conn, ctx.pod_id, ctx.shard_id, pod_started_at)
-    ctx.latest_status = status  # StatusServer's status_provider reads this directly
     if ctx.storage_client is not None and ctx.bucket is not None:
         try:
             heartbeat.push_status_to_r2(ctx.storage_client, ctx.bucket, ctx.pod_id, status)
-        except Exception:
+        except Exception as exc:
+            # Swallowing this exception used to leave the R2 push's own failure mode
+            # completely invisible -- poll_status.py only reads R2, so a pod whose R2
+            # write was silently failing looked identical (no R2 object, RunPod status
+            # RUNNING) to one still bootstrapping. Stash it in the status dict itself so
+            # the redundant local HTTP channel (still updated below) surfaces *why*, even
+            # though the R2 write that should have carried this same detail just failed.
             logger.exception("heartbeat push to R2 failed -- continuing (local HTTP status channel still serves it)")
+            status["heartbeat_r2_push_error"] = f"{type(exc).__name__}: {exc}"
+    ctx.latest_status = status  # StatusServer's status_provider reads this directly
 
 
 def run_queue(ctx: RunContext, shard: int | None = None, max_episodes: int | None = None) -> dict:
-    """Main per-pod driver loop: claims this pod's failed-then-queued
-    episodes (failed first, since resume_stage picks up from the failure
-    point rather than restarting from queued), checks budget/time caps
-    before each new episode, and records a cost checkpoint + heartbeat after
-    every one. Never raises on a single episode's failure -- see
-    process_episode."""
+    """Main per-pod driver loop: claims this pod's failed-then-stalled-then-
+    queued episodes (in that order, since resume_stage/skip-guards let each
+    pick up from wherever it left off rather than restarting from scratch),
+    checks budget/time caps before each new episode, and records a cost
+    checkpoint + heartbeat after every one. Never raises on a single
+    episode's failure -- see process_episode. "Stalled" (db.list_stalled_episodes)
+    covers a process killed externally mid-stage (pod crash/restart) with no
+    Python exception ever raised -- those episodes would otherwise be stuck
+    forever, matching neither the failed nor queued query."""
     pod_started_iso = db.get_run_meta(ctx.conn, "pod_started_at")
     if pod_started_iso is None:
         pod_started_iso = db.now_iso()
@@ -391,7 +441,22 @@ def run_queue(ctx: RunContext, shard: int | None = None, max_episodes: int | Non
 
     costs.record_egress(ctx.conn)  # measured-zero, once per run start (see costs.record_egress)
 
-    episodes = list(db.list_failed_episodes(ctx.conn, shard=shard)) + list(db.list_queued_episodes(ctx.conn, shard=shard))
+    # Heartbeat was previously only pushed after a full episode finished --
+    # for a real podcast episode (model load + download + VAD + diarize + ASR
+    # + clip export) that can be 10-30+ minutes, so R2/poll_status.py stayed
+    # completely blind for that whole window with no way to tell "still
+    # working on episode 1" apart from "crash-looped before models even
+    # loaded". Push one right away so pod restart/startup is visible
+    # immediately.
+    _push_heartbeat(ctx)
+    _snapshot_db_to_r2(ctx)
+    _sync_log_to_r2(ctx)
+
+    episodes = (
+        list(db.list_failed_episodes(ctx.conn, shard=shard))
+        + list(db.list_stalled_episodes(ctx.conn, shard=shard))
+        + list(db.list_queued_episodes(ctx.conn, shard=shard))
+    )
     if max_episodes is not None:
         episodes = episodes[:max_episodes]
 
@@ -405,7 +470,7 @@ def run_queue(ctx: RunContext, shard: int | None = None, max_episodes: int | Non
             break
 
         avg_cost_per_episode = (db.total_cost(ctx.conn) / processed) if processed else 0.0
-        if costs.should_stop_for_budget(ctx.conn, avg_cost_per_episode, ctx.cfg.cost):
+        if costs.should_stop_for_budget(ctx.conn, avg_cost_per_episode, ctx.cfg.cost, pod_count=ctx.num_pods):
             logger.warning("budget cap reached ($%.2f spent) -- stopping before episode %s", db.total_cost(ctx.conn), episode_row["episode_id"])
             break
 
@@ -416,5 +481,7 @@ def run_queue(ctx: RunContext, shard: int | None = None, max_episodes: int | Non
 
         _record_gpu_compute_checkpoint(ctx, pod_started_at)
         _push_heartbeat(ctx)
+        _snapshot_db_to_r2(ctx)
+        _sync_log_to_r2(ctx)
 
     return {"processed": processed, "succeeded": succeeded, "failed": failed, "total_episodes_claimed": len(episodes)}
