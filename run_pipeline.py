@@ -50,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     storage_client, bucket = None, None
     if not args.no_upload:
         try:
-            secrets.require_for_network_ops()
+            secrets.require_r2()
             storage_client = storage.build_client(secrets)
             bucket = secrets.r2_bucket_name
         except config.ConfigError as exc:
@@ -62,6 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     ctx = pipeline_runner.RunContext(
         conn=conn, cfg=cfg, models=models, work_dir=Path(args.work_dir),
         storage_client=storage_client, bucket=bucket, pod_id=args.pod_id, shard_id=args.shard,
+        db_path=args.db, log_path=args.log_path, num_pods=secrets.num_pods,
     )
 
     status_port = args.status_port if args.status_port is not None else cfg.monitoring.status_http_port

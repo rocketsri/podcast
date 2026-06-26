@@ -74,6 +74,7 @@ class EnvSecrets:
     hf_token: str
     budget_cap_usd: float
     time_cap_hours: float
+    num_pods: int
 
     @classmethod
     def from_env(cls, env: dict | None = None) -> "EnvSecrets":
@@ -89,20 +90,24 @@ class EnvSecrets:
             hf_token=env.get("HF_TOKEN", ""),
             budget_cap_usd=float(env.get("BUDGET_CAP_USD", "100")),
             time_cap_hours=float(env.get("TIME_CAP_HOURS", "24")),
+            num_pods=int(env.get("NUM_PODS", "1")),
         )
 
-    def require_for_network_ops(self) -> None:
+    def require_r2(self) -> None:
+        """Callers that only ever touch R2 (run_pipeline.py's per-pod storage
+        client, merge_shards.py, package_code.py) must check only R2 vars --
+        a pod running the free iTunes+RSS discovery path never has
+        PODCASTINDEX_*/RUNPOD_API_KEY in its env at all (see
+        bootstrap_pod.py's build_env), so a check requiring every service's
+        credentials would always fail there and silently force the pod into
+        local-only mode (storage_client stays None, nothing ever reaches R2)."""
         missing = [
             name
             for name, value in (
-                ("PODCASTINDEX_API_KEY", self.podcastindex_api_key),
-                ("PODCASTINDEX_API_SECRET", self.podcastindex_api_secret),
-                ("RUNPOD_API_KEY", self.runpod_api_key),
                 ("R2_ACCOUNT_ID", self.r2_account_id),
                 ("R2_ACCESS_KEY_ID", self.r2_access_key_id),
                 ("R2_SECRET_ACCESS_KEY", self.r2_secret_access_key),
                 ("R2_BUCKET_NAME", self.r2_bucket_name),
-                ("HF_TOKEN", self.hf_token),
             )
             if not value
         ]
