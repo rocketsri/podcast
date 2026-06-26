@@ -21,7 +21,7 @@ English at discovery time (`select_podcasts_free.py --language-prefix`,
 default "en"), and on short/noisy/ambiguous clips Whisper's own
 auto-detection occasionally misfires to a wrong language and decodes fluent
 -looking gibberish in it -- a known Whisper failure mode, confirmed live in
-this corpus (PROBLEMS.md #19). Pinning the language to what every clip
+this corpus (PROBLEMS.md #20). Pinning the language to what every clip
 actually is removes that failure mode at the source rather than just
 filtering its output after the fact.
 """
