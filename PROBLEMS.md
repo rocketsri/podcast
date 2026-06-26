@@ -357,3 +357,65 @@ diagnostic signature that distinguished it from #12: *zero* lines ever
 appear in the container's logs at all (not even the first `[bootstrap]`
 echo), because the failure is at container creation, a layer below
 where `bootstrap.sh` runs.
+
+## 14. Relaxed torch/torchaudio pins let pip drift to versions pyannote.audio can't import
+
+**Problem.** After the #13 host-migration fix, shards 0-4 (all relaunched
+with the #12 fix) looked idle from telemetry alone -- near-zero/negative
+`uptimeInSeconds`, 0% GPU, no R2 heartbeats -- but the user flagged that
+the RunPod console showed them visibly restarting on a loop. The Docker
+engine-event log (system log) for shard-4 showed a clean image pull, one
+successful container start, ~2.5 minutes of activity, then an unbroken
+`start container ... begin` loop every ~16s for 10.5+ minutes with **no
+error line at all** -- a third pattern, distinct from both #12 (app bug,
+full traceback visible in that same log) and #13 (host driver, explicit
+`nvidia-container-cli` error every cycle). The engine-event log doesn't
+carry the container's own stdout, so the actual cause was invisible until
+the user pulled the separate **application/container log** (a different
+tab in the RunPod console).
+
+**Root cause.** That log showed `bootstrap.sh` itself failing, every
+cycle, at its own fail-fast guard from the #12 fix:
+```
+File ".../pyannote/audio/core/io.py", line 60, in <module>
+    ) -> torchaudio.AudioMetaData:
+AttributeError: module 'torchaudio' has no attribute 'AudioMetaData'
+[bootstrap] FATAL: core deps not importable after install -- aborting
+```
+`requirements.txt` pinned `torch>=2.5.1` / `torchaudio>=2.5.1` (relaxed
+from exact `==2.5.1` pins in the #13-adjacent multi-pod-scale-out commit,
+specifically so pip would treat the RunPod image's preinstalled torch
+2.7.1 as already-satisfied and skip a slow reinstall). In practice pip's
+resolver did not stop at the preinstalled version -- the install log shows
+it pulled `torch-2.12.1` and `torchaudio-2.11.0`, both far newer than
+`pyannote.audio==3.3.2` was built against. `pyannote.audio` declares no
+upper bound on torch/torchaudio in its own package metadata, so pip
+happily resolves the combination; the incompatibility only surfaces at
+*import time*, as an `AttributeError` on an API pyannote's code still
+expects. Because `bootstrap.sh` reinstalls `requirements.txt`
+unconditionally on every restart (not just once per container), every
+single restart hit the same resolution and the same import failure,
+forever -- explaining the all-zero telemetry (the failure is in
+`bootstrap.sh`, well before `run_pipeline.py` and its status server ever
+start) with no Docker-level error (the container itself starts and runs
+fine; it's the application script that deliberately `exit 1`s).
+
+**Fix.** Reverted `requirements.txt` to the exact pins proven to work
+before the relaxation: `torch==2.5.1` / `torchaudio==2.5.1`. No pod
+restart/terminate was needed -- `bootstrap.sh` already re-clones the
+branch HEAD on every restart, so the already-looping pods pick up the fix
+on their next automatic cycle.
+
+**Takeaway.** An unbounded `>=` pin on a fast-moving package (torch) is
+not equivalent to "prefer the preinstalled version" -- pip's resolver can
+and did drift to the newest release on PyPI instead, several minor
+versions past what a pinned, less-actively-maintained dependency
+(`pyannote.audio==3.3.2`) was validated against. A correctness-critical
+transitive dependency like this needs an explicit pin (or at least an
+upper bound), not just a floor; the "skip a slow reinstall" optimization
+that motivated the floor-only pin should have been scoped with an upper
+bound from the start. The diagnostic signature that distinguished this
+from #12 and #13: the Docker/system log alone showed a clean restart loop
+with *no* error text anywhere -- only the separate application-log tab
+revealed the actual Python traceback and the deliberate `bootstrap.sh`
+abort.
