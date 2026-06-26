@@ -15,6 +15,11 @@ from pipeline import db, discovery
 
 DOWNLOAD_CHUNK_BYTES = 1 << 20  # 1MB
 
+# Some podcast CDNs (observed: buzzsprout.com, acast.com) return HTTP 403 to
+# requests' default "python-requests/x.x" User-Agent, treating it as a
+# non-browser scraper -- a plain browser UA is enough to get a normal 200.
+DOWNLOAD_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
+
 
 class IngestError(RuntimeError):
     pass
@@ -66,7 +71,7 @@ def download_episode_audio(source_url: str, dest_path: str | Path, timeout: floa
     """Streams the episode's raw audio to disk."""
     dest_path = Path(dest_path)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(source_url, stream=True, timeout=timeout) as resp:
+    with requests.get(source_url, stream=True, timeout=timeout, headers=DOWNLOAD_HEADERS) as resp:
         if resp.status_code != 200:
             raise IngestError(f"download failed (HTTP {resp.status_code}) for {source_url}")
         with dest_path.open("wb") as f:

@@ -213,6 +213,19 @@ def _ensure_diarized_and_clustered(ctx: RunContext, episode_row: sqlite3.Row) ->
     db.advance_stage(ctx.conn, episode_id, "clustering_done")
 
     _maybe_recluster_podcast(ctx, podcast_id)
+
+    # If the recluster above just fired, it deleted and rebuilt every speakers
+    # row for this podcast -- including the ones ingest_episode_diarization
+    # just wrote for this episode -- and rewrote
+    # local_speaker_segments.resolved_speaker_id to match. label_to_speaker
+    # still holds the pre-recluster speaker_ids, which a moment later would no
+    # longer exist in speakers, so build_candidate_clips/persist_candidate_clips
+    # downstream would insert a clip referencing a deleted speaker_id and hit
+    # the FOREIGN KEY constraint. Re-derive from the now-authoritative
+    # persisted segments instead of trusting the possibly-stale dict (same
+    # query the resume/skip-guard branch above already uses).
+    segments = db.get_local_speaker_segments_for_episode(ctx.conn, episode_id)
+    label_to_speaker = {s["local_label"]: s["resolved_speaker_id"] for s in segments}
     return result.turns, label_to_speaker
 
 
