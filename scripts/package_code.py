@@ -63,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
 
     secrets = config.EnvSecrets.from_env()
     try:
-        secrets.require_for_network_ops()
+        secrets.require_r2()
     except config.ConfigError as exc:
         logger.error("cannot upload, missing R2 credentials: %s", exc)
         return 1
