@@ -525,3 +525,43 @@ download this gated file" -- gated-repo enforcement in `huggingface_hub`
 connectivity/smoke check for gated content should exercise the same call
 the real code makes, not a cheaper-looking substitute that happens to
 return 200/OK for an unrelated reason.
+
+## 17. RunPod base image sets HF_HUB_ENABLE_HF_TRANSFER=1; we never installed hf_transfer
+
+**Problem.** Right after the HF gated-license agreement was accepted
+(#16) and shards restarted past that blocker, a live shard hit a new
+crash immediately on the very same `hf_hub_download()` call:
+```
+ValueError: Fast download using 'hf_transfer' is enabled
+(HF_HUB_ENABLE_HF_TRANSFER=1) but 'hf_transfer' package is not available
+in your environment. Try `pip install hf_transfer`.
+```
+
+**Root cause.** Same family as #14 (base-image preinstalled state silently
+dropped by our own fresh `pip install -r requirements.txt`), one
+environment-variable layer instead of a package-pin layer this time: the
+RunPod base image (`runpod/pytorch:1.0.7-cu1281-torch271-ubuntu2204`,
+see `scripts/bootstrap_pod.py`'s `DEFAULT_IMAGE`) bakes in
+`HF_HUB_ENABLE_HF_TRANSFER=1` so HF downloads use the faster Rust-backed
+transfer path by default. `huggingface_hub` checks that env var on every
+download and raises `ValueError` (not a silent fallback) if the
+`hf_transfer` package isn't actually installed. `requirements.txt` never
+listed `hf_transfer`, so every single `hf_hub_download()` call -- the
+gated pipeline checkpoint, its segmentation/embedding sub-models, all of
+them -- was guaranteed to fail this way the moment the gated-access
+blocker (#16) was cleared.
+
+**Fix.** Added `hf_transfer==0.1.9` to `requirements.txt`. Verified
+locally first: installed it in the same audit venv, set
+`HF_HUB_ENABLE_HF_TRANSFER=1` to match the pod's actual environment, and
+called `hf_hub_download()` against the real gated repo with the real
+`HF_TOKEN` -- succeeded. `pip install --dry-run` with the pin appended
+showed no conflicts against the rest of the stack.
+
+**Takeaway.** The base-image-drift risk from #14 isn't limited to
+preinstalled *packages* -- it extends to preinstalled *environment
+variables* that silently assume a package will be present. Worth a final
+check of the rest of the RunPod base image's default env (`env | grep
+HF_\|TRANSFORMERS_\|TORCH_` on a fresh pod, not yet done) for any other
+opt-in-by-default behavior our minimal `requirements.txt` doesn't
+actually satisfy.
