@@ -14,6 +14,16 @@ those are joined into one utterance and their two confidence signals
 averaged, duration-weighted, into one number per clip -- the same
 duration-weighted-average pattern used elsewhere in this codebase
 (cluster.py's centroid updates, segment.py's vad_confidence).
+
+`language="en"` is passed explicitly rather than left to Whisper's
+per-clip auto-detection: every podcast in the corpus is already filtered to
+English at discovery time (`select_podcasts_free.py --language-prefix`,
+default "en"), and on short/noisy/ambiguous clips Whisper's own
+auto-detection occasionally misfires to a wrong language and decodes fluent
+-looking gibberish in it -- a known Whisper failure mode, confirmed live in
+this corpus (PROBLEMS.md #19). Pinning the language to what every clip
+actually is removes that failure mode at the source rather than just
+filtering its output after the fact.
 """
 
 from __future__ import annotations
@@ -46,7 +56,7 @@ def transcribe_clip(samples: np.ndarray, sample_rate: int, model: WhisperModel) 
     if sample_rate != 16000:
         raise ValueError(f"asr.transcribe_clip expects 16kHz audio, got {sample_rate}")
 
-    segments, _info = model.transcribe(samples, condition_on_previous_text=False)
+    segments, _info = model.transcribe(samples, language="en", condition_on_previous_text=False)
     segments = list(segments)
     if not segments:
         return TranscriptionResult(utterance="", no_speech_prob=1.0, avg_logprob=0.0)

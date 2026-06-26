@@ -636,3 +636,122 @@ logger.exception(...)` with no surfaced detail is functionally a silent
 failure in any environment without log access, regardless of intent;
 swallowed exceptions need to leave a trace somewhere a caller without
 shell access can actually see, not just in a log file nothing reads.
+
+## 19. buzzsprout.com downloads are blocked by Cloudflare bot-management, not the CDN UA-sniffing `ingest.py` already handles
+
+**Problem.** Live shard logs showed recurring `download failed (HTTP 403)`
+errors for every `buzzsprout.com` episode, e.g.:
+```
+episode free_dda660b3ed3e_ep_4a01ca3eec1cdf0d failed at downloading:
+download failed (HTTP 403) for https://www.buzzsprout.com/2309367/episodes/...
+```
+This looked at first like a regression of an already-"fixed" issue --
+`ingest.py`'s `DOWNLOAD_HEADERS` browser User-Agent was added specifically
+because buzzsprout.com (named explicitly in that comment) 403s the default
+`python-requests` UA.
+
+**Root cause.** Reproduced directly with `curl`, from this sandbox (a
+network with no relationship to RunPod's IP ranges), both with and without
+the matching browser UA, and with and without a `Referer` header. Every
+combination returned the same thing: a literal Cloudflare bot-management
+challenge page ("Sorry, you have been blocked" / "Attention Required!"),
+not a buzzsprout-application-level 403. This is a categorically different
+mechanism from the UA-sniffing the existing fix targets -- Cloudflare's
+bot-management sits in front of the origin and challenges the request
+before buzzsprout's own server (or its CDN's simple UA check) ever sees
+it. No request header combination defeats it, and the block reproduces
+identically regardless of source IP, so it isn't RunPod-specific either.
+Cross-checked all 6 shards' live `db_snapshot` SQLite files: **zero**
+buzzsprout-hosted episodes have ever completed fleet-wide (shard-2: 24
+total / 0 done / 9 failed; shard-5: 24 total / 0 done / 4 failed; shards
+0/3/4 have zero buzzsprout episodes in their queues at all, since
+discovery is per-shard-partitioned -- see #8).
+
+**Fix.** None attempted, deliberately. Defeating Cloudflare's
+bot-management would require browser automation/challenge-solving, IP
+rotation, or TLS-fingerprint spoofing -- all of which cross from "fix our
+own pipeline" into "evade a third party's legitimate anti-scraping
+protection," which this project will not do. The failure is already
+clean and cheap: it happens at the `downloading` stage, before any GPU
+work starts, so blocked episodes cost nothing but the failed HTTP request
+and retry the same way any other download failure does (`pipeline_runner`'s
+failed-episode requeue), with no data loss. Updated the now-stale
+`ingest.py` comment (it implied the UA fix is a universal CDN-403
+solution) to point at this entry instead. Recorded as an accepted
+limitation in `LIMITATIONS.md` rather than chased further.
+
+**Takeaway.** Two different 403 mechanisms can look identical from inside
+the pipeline (same exception, same log line) but require completely
+different responses -- one was a one-line header fix, the other isn't
+fixable at all without crossing an ethical line this project draws at
+"don't evade anti-bot protection." Confirming via the actual response
+body/headers (not just the status code) is what told them apart.
+
+## 20. Whisper's per-clip language auto-detection occasionally hallucinates wrong-language gibberish that the ASR-confidence filter didn't catch
+
+**Problem.** Sampling real transcripts from all 6 shards' live db snapshots
+(prompted by a request to spot-check transcription quality, not just
+metadata) turned up a small cluster of kept (`discard_reason IS NULL`,
+uploaded) clips whose `utterance` text was fluent-looking but nonsensical
+Welsh-like gibberish on clips from podcasts whose RSS feed -- and Whisper's
+own auto-detected language on neighboring clips -- is unambiguously
+English, e.g.:
+```
+ti ei talaut i i-rργgen o Chieddwn a bethan di'n care کو ai'r fy yma fe
+iwiol ei wylegu'u. A choddiasio ph mistakespin iaud, ac i bethan ag ei
+bPhoneopaka...
+```
+with `avg_logprob` as low as -4.79 (median for genuinely good clips across
+the fleet is about -0.40).
+
+**Root cause.** `asr.py`'s `transcribe_clip()` called
+`model.transcribe(samples, condition_on_previous_text=False)` with no
+`language` argument, so faster-whisper auto-detects language
+independently per clip (1-30s slices). On short, noisy, or otherwise
+ambiguous clips this auto-detection occasionally misfires to the wrong
+language and decodes fluent-sounding gibberish in it -- a known Whisper
+failure mode. Because real speech genuinely is present, `no_speech_prob`
+stays low (0.01-0.13 in the sampled cases) even though the decoded text is
+garbage; `quality.py`'s `low_asr_confidence` filter required **both**
+`no_speech_prob > 0.6` **and** `avg_logprob < -1.2` to discard (`evaluate_
+clip_discard_reason`, "neither alone is trusted as a sole trigger"), so
+these clips' catastrophically bad `avg_logprob` alone never tripped it.
+Quantified the blast radius across all 6 shards' live snapshots before
+fixing anything: 0.07%-0.73% of kept clips per shard, 0.09%-1.16% of kept
+seconds, concentrated in 2-5 distinct episodes per shard (not spread
+randomly) -- consistent with specific hard-to-decode episodes/segments
+rather than a systemic mistranscription problem across the whole corpus.
+
+**Fix.** Two changes, addressing cause and symptom respectively: (1)
+`asr.py` now passes `language="en"` explicitly to `model.transcribe()` --
+every podcast in the corpus is already filtered to English at discovery
+time (`select_podcasts_free.py --language-prefix`, default `"en"`), so
+pinning the decode language to what every clip actually is removes the
+auto-detection misfire at the source. (2) `quality.py`'s
+`evaluate_clip_discard_reason` now also discards on `avg_logprob` alone
+past a new, far more extreme standalone floor (`catastrophic_avg_logprob_
+floor: -2.0` in `config/pipeline.yaml`), independent of `no_speech_prob` --
+a safety net for this failure mode (or any other cause of equally
+catastrophic decode confidence) without weakening the original AND-gated
+check for ordinary, moderate ASR uncertainty (accents, jargon) in the
+-1.2-to-2.0 range, which is a real and distinct signal-quality tier from
+the gibberish tier. Added `tests/test_quality.py::
+test_low_asr_confidence_triggers_on_catastrophic_avg_logprob_alone` (and
+renamed the now-inverted `..._does_not_trigger_when_only_avg_logprob_bad`
+test to `..._does_not_trigger_when_only_moderately_avg_logprob_bad`, with
+its threshold value adjusted to stay below the new catastrophic floor).
+Already-uploaded affected clips on the live pods are not retroactively
+re-flagged in R2 -- the next `scripts/merge_shards.py`/manifest-generation
+pass can re-derive `discard_reason` from each clip's already-recorded
+`avg_logprob` against the new floor without needing any pod restart or
+re-transcription, since the raw ASR signal was always captured correctly;
+only the discard *decision* was too lenient.
+
+**Takeaway.** An AND-gated combination of two "untrusted alone" signals
+can still miss a failure mode where one signal is reliably bad and the
+other is reliably fine for a *different* reason than the design assumed
+(here: real speech genuinely present, just decoded in the wrong
+language) -- worth checking each signal's own extreme tail independently,
+not just the combination, especially for a generative model output like
+ASR text where confidence and correctness can decouple in either
+direction.

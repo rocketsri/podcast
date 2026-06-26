@@ -15,9 +15,11 @@ from pipeline import db, discovery
 
 DOWNLOAD_CHUNK_BYTES = 1 << 20  # 1MB
 
-# Some podcast CDNs (observed: buzzsprout.com, acast.com) return HTTP 403 to
-# requests' default "python-requests/x.x" User-Agent, treating it as a
-# non-browser scraper -- a plain browser UA is enough to get a normal 200.
+# Some podcast CDNs (observed: acast.com) return HTTP 403 to requests'
+# default "python-requests/x.x" User-Agent, treating it as a non-browser
+# scraper -- a plain browser UA is enough to get a normal 200. This does
+# NOT cover every 403 source, though: buzzsprout.com's 403s are a separate,
+# unfixable-by-header Cloudflare bot-management block -- see PROBLEMS.md #19.
 DOWNLOAD_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
 
 

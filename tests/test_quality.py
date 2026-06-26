@@ -24,6 +24,7 @@ def make_cfg(**overrides):
         music_spectral_flatness_floor=0.35,
         low_asr_confidence_no_speech_prob=0.6,
         low_asr_confidence_avg_logprob=-1.2,
+        catastrophic_avg_logprob_floor=-2.0,
         ad_heuristic_spectral_flatness_floor=0.20,
         ad_heuristic_no_speech_prob_floor=0.35,
         intro_outro_window_seconds=30.0,
@@ -211,13 +212,31 @@ def test_low_asr_confidence_does_not_trigger_when_only_no_speech_prob_bad():
     assert reason != "low_asr_confidence"
 
 
-def test_low_asr_confidence_does_not_trigger_when_only_avg_logprob_bad():
+def test_low_asr_confidence_does_not_trigger_when_only_moderately_avg_logprob_bad():
+    """A moderately bad avg_logprob with a fine no_speech_prob (e.g. an
+    unusual accent or jargon Whisper is just somewhat unsure about) must not
+    discard on its own -- only the catastrophic floor below should."""
+    cfg = make_cfg()
+    row = make_clip_row(vad_confidence=0.9, no_speech_prob=0.05, avg_logprob=-1.5)
+    reason = quality.evaluate_clip_discard_reason(
+        row, speech_like_samples(), SAMPLE_RATE, 1000.0, [], cfg
+    )
+    assert reason != "low_asr_confidence"
+
+
+def test_low_asr_confidence_triggers_on_catastrophic_avg_logprob_alone():
+    """Whisper's per-clip language auto-detection occasionally misfires on
+    short/ambiguous clips and decodes fluent-looking gibberish in the wrong
+    language -- no_speech_prob stays low (real speech IS present) but
+    avg_logprob craters far past the moderate floor (confirmed live,
+    PROBLEMS.md #19). This must be caught even though no_speech_prob alone
+    looks fine."""
     cfg = make_cfg()
     row = make_clip_row(vad_confidence=0.9, no_speech_prob=0.05, avg_logprob=-3.0)
     reason = quality.evaluate_clip_discard_reason(
         row, speech_like_samples(), SAMPLE_RATE, 1000.0, [], cfg
     )
-    assert reason != "low_asr_confidence"
+    assert reason == "low_asr_confidence"
 
 
 def test_low_asr_confidence_none_values_skip_check():
