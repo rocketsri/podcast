@@ -59,9 +59,22 @@ run_pipeline.py  # CLI entrypoint (what infra/bootstrap.sh invokes on a real pod
 1. `pip install -r requirements.txt` (pinned versions; on a real GPU box, `pip uninstall -y torchvision` afterward — see `infra/bootstrap.sh` and `PROBLEMS.md` for the torch/torchvision conflict this works around).
 2. Copy `.env.example` to `.env` and fill in: `PODCASTINDEX_API_KEY`/`SECRET` (free account at podcastindex.org), `RUNPOD_API_KEY`, `R2_ACCOUNT_ID`/`ACCESS_KEY_ID`/`SECRET_ACCESS_KEY`/`BUCKET_NAME` (Cloudflare R2), `HF_TOKEN` (with the pyannote 3.1 + embedding model gated-model agreements accepted on huggingface.co), `BUDGET_CAP_USD`/`TIME_CAP_HOURS` guardrails.
 3. Local/dev run (no GPU, no R2 required): `python3 run_pipeline_local.py` — uses a CPU diarization fallback (`pipeline/local_diarize.py`) for iteration without real GPU access.
-4. Real GPU pod run: `python3 run_pipeline.py --db work/pipeline.db --work-dir work --log-path work/pipeline.log --pod-id <pod-id> --device cuda` — this is exactly what `infra/bootstrap.sh` runs on a RunPod pod; pass `--shard <n>` for a multi-pod fleet (set up via `scripts/partition_episodes.py` first), `--max-episodes` to cap a smoke test, `--no-upload` to skip R2 (clips stay local).
-5. After a fleet run: `python3 scripts/merge_shards.py --auto-discover --output-db work/merged.db --manifest-out work/manifest.jsonl` to merge every pod's R2-snapshotted database and re-run cross-episode speaker clustering from scratch per podcast; `python3 scripts/report.py --db work/merged.db --out-dir .` to regenerate `PROCESSING_SUMMARY.md`/`COST_REPORT.md`; `python3 scripts/validate_manifest.py work/manifest.jsonl` to sanity-check schema/duration bounds.
+4. Real GPU pod run: `python3 run_pipeline.py --db work/pipeline.db --work-dir work --log-path work/pipeline.log --pod-id <pod-id> --device cuda` — this is exactly what `infra/bootstrap.sh` runs on a RunPod pod; pass `--shard <n>` for a multi-pod fleet (set up via `python3 scripts/partition_episodes.py --shards <n>` first, run once against the shared queue before any pod starts), `--max-episodes` to cap a smoke test, `--no-upload` to skip R2 (clips stay local).
+5. After a fleet run: `python3 scripts/merge_shards.py --auto-discover --output-db work/merged.db --manifest-out work/manifest.jsonl` to merge every pod's R2-snapshotted database and re-run cross-episode speaker clustering from scratch per podcast; `python3 scripts/report.py --db work/merged.db --out-dir .` to regenerate `PROCESSING_SUMMARY.md`/`COST_REPORT.md`; `python3 scripts/validate_manifest.py --manifest work/manifest.jsonl` to sanity-check schema/duration bounds.
 6. Tests: `python3 -m pytest tests/` — pure Python, no GPU/network required.
+
+## Verifying the live submission without any credentials
+
+Everything below works from a clean checkout with no `.env`, no R2/RunPod keys, and no GPU — it pulls straight from the public Worker URL above:
+
+```
+curl -o manifest.jsonl https://podcast-dataset-public.podcast-dataset-rocketsri.workers.dev/v2/manifest/manifest.jsonl
+python3 scripts/validate_manifest.py --manifest manifest.jsonl   # schema + duration-bound checks against the real, live manifest
+head -1 manifest.jsonl   # grab a clip_id/podcast_id/episode_id to build a clip URL, e.g.:
+curl -o sample_clip.flac https://podcast-dataset-public.podcast-dataset-rocketsri.workers.dev/v2/clips/<podcast_id>/<episode_id>/<clip_id>.flac
+```
+
+That last `curl` pulls a real 16kHz mono FLAC clip end-to-end — enough to confirm the manifest and the audio agree, with zero infra setup.
 
 ## Reading order
 
