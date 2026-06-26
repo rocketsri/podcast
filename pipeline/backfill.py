@@ -30,7 +30,7 @@ class BackfillResult:
     failed: int
 
 
-def backfill_uploaded_clips(conn: sqlite3.Connection, client, bucket: str) -> BackfillResult:
+def backfill_uploaded_clips(conn: sqlite3.Connection, client, bucket: str, key_prefix: str = "") -> BackfillResult:
     rows = conn.execute(
         "SELECT clip_id, episode_id, podcast_id, local_flac_path FROM clips"
         " WHERE uploaded = 1 AND local_flac_path IS NOT NULL"
@@ -43,12 +43,14 @@ def backfill_uploaded_clips(conn: sqlite3.Connection, client, bucket: str) -> Ba
     reuploaded = 0
     failed = 0
     for row in candidates:
-        key = storage.clip_key(row["podcast_id"], row["episode_id"], row["clip_id"])
+        key = storage.clip_key(row["podcast_id"], row["episode_id"], row["clip_id"], key_prefix)
         try:
             if storage.object_exists(client, bucket, key):
                 already_present += 1
                 continue
-            storage.upload_clip(client, bucket, row["local_flac_path"], row["podcast_id"], row["episode_id"], row["clip_id"])
+            storage.upload_clip(
+                client, bucket, row["local_flac_path"], row["podcast_id"], row["episode_id"], row["clip_id"], key_prefix,
+            )
             if not storage.object_exists(client, bucket, key):
                 raise RuntimeError(f"upload_file reported success for {key} but object_exists is False after")
             reuploaded += 1

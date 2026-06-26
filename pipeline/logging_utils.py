@@ -77,7 +77,7 @@ def get_logger() -> logging.Logger:
     return logging.getLogger(LOGGER_NAME)
 
 
-def sync_log_to_r2(client, bucket: str, pod_id: str, log_path: str | Path) -> None:
+def sync_log_to_r2(client, bucket: str, pod_id: str, log_path: str | Path, key_prefix: str = "") -> None:
     from pipeline import storage  # local import: keeps logging_utils importable with no boto3 present
 
-    storage.upload_file(client, bucket, log_path, f"logs/{pod_id}.log")
+    storage.upload_file(client, bucket, log_path, storage.log_key(pod_id, key_prefix))

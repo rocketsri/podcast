@@ -71,6 +71,7 @@ class EnvSecrets:
     r2_access_key_id: str
     r2_secret_access_key: str
     r2_bucket_name: str
+    r2_key_prefix: str
     hf_token: str
     budget_cap_usd: float
     time_cap_hours: float
@@ -87,6 +88,14 @@ class EnvSecrets:
             r2_access_key_id=env.get("R2_ACCESS_KEY_ID", ""),
             r2_secret_access_key=env.get("R2_SECRET_ACCESS_KEY", ""),
             r2_bucket_name=env.get("R2_BUCKET_NAME", ""),
+            # Defaults to a non-empty value deliberately: an earlier batch's
+            # clips/status objects already sit in the bucket under the bare
+            # (unprefixed) clips/, status/ paths with no surviving
+            # db_snapshot/manifest to back them (their producing pod was
+            # terminated before either upload path was wired up). A non-empty
+            # default means every future run is nested under its own prefix
+            # without anyone having to remember to set R2_KEY_PREFIX by hand.
+            r2_key_prefix=env.get("R2_KEY_PREFIX", "v2"),
             hf_token=env.get("HF_TOKEN", ""),
             budget_cap_usd=float(env.get("BUDGET_CAP_USD", "100")),
             time_cap_hours=float(env.get("TIME_CAP_HOURS", "24")),

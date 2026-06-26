@@ -87,10 +87,10 @@ def build_status(
     return status
 
 
-def push_status_to_r2(client, bucket: str, pod_id: str, status: dict) -> None:
+def push_status_to_r2(client, bucket: str, pod_id: str, status: dict, key_prefix: str = "") -> None:
     from pipeline import storage  # local import: keeps heartbeat importable with no boto3 present
 
-    storage.put_json(client, bucket, storage.status_key(pod_id), status)
+    storage.put_json(client, bucket, storage.status_key(pod_id, key_prefix), status)
 
 
 class _StatusHandler(BaseHTTPRequestHandler):
