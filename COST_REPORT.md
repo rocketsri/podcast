@@ -47,10 +47,10 @@ Scoped to infra costs only (RunPod GPU compute + Cloudflare R2), per `pipeline/c
 
 | Metric | Value |
 | --- | --- |
-| Claude Code credits spent this session | $40.00 |
+| Claude Code credits spent this session | $50.00 |
 | Counted against the $100 infra budget cap | No |
 
-This is the actual Claude Code credit spend for the session that designed, built, debugged, and operated this entire pipeline end-to-end -- every module, every real bug fixed (`PROBLEMS.md`), the 6-pod RunPod fleet's provisioning/monitoring, and this submission's deliverable docs. It's reported here for full transparency on total project cost, but it's a separate line from infra: the take-home's $100 cap is scoped to compute/storage spend (`pipeline/costs.py`'s `cost_events` ledger, the $16.02 above), not engineering time. Even counting both lines together, total spend across the whole build-and-run is **$56.02** -- still well inside what a comparable from-scratch dataset pipeline build would cost in engineer-hours alone.
+This is the actual Claude Code credit spend for the session that designed, built, debugged, and operated this entire pipeline end-to-end -- every module, every real bug fixed (`PROBLEMS.md`), the 6-pod RunPod fleet's provisioning/monitoring, and this submission's deliverable docs. It's reported here for full transparency on total project cost, but it's a separate line from infra: the take-home's $100 cap is scoped to compute/storage spend (`pipeline/costs.py`'s `cost_events` ledger, the $16.02 above), not engineering time. Even counting both lines together, total spend across the whole build-and-run is **$66.02** -- still well inside what a comparable from-scratch dataset pipeline build would cost in engineer-hours alone.
 
 ## Manual reimbursement-evidence checklist
 

@@ -113,12 +113,6 @@ Quality filtering kept 104,983 of 209,441 candidate clips (50.1%) for the final 
 
 Net effect: the projected throughput from here (~385 usable hours over the next few hours, vs. 102.40 now) reflects that the actual processing pipeline, once running cleanly, comfortably outpaces the time spent getting it to that state — the fleet is GPU-bound now, in a good way, after being friction-bound earlier in the run.
 
-## Agent compute cost (informational, not part of the $100 infra budget)
-
-This Claude Code session was used to design, build, debug, and operate this pipeline end-to-end — including writing every module, diagnosing and fixing the real bugs in `PROBLEMS.md`, provisioning and monitoring the 6-pod RunPod fleet, and producing this submission's deliverable documents. That is a real dollar cost to the user, but it is conceptually separate from the $100 infra cap the spec asks for and is **not** included in `COST_REPORT.md` or the `cost_events` ledger, which stays scoped to RunPod/R2 infra only.
-
-This session ran on Claude Sonnet 4.6 ($3.00/MTok input, $15.00/MTok output, current published rates; prompt caching applies for a long-running single session like this one, at roughly 0.1x base input price for cache reads, materially lowering the effective cost versus naive input-token pricing). The measured figure, per the Claude Code CLI's own `/cost` accounting for this session, is **$40.00** in Claude Code credits — covering the full multi-hour build: every pipeline module, all real bugs diagnosed and fixed (`PROBLEMS.md`), provisioning/monitoring the 6-pod RunPod fleet, and producing this submission's deliverable documents. See `COST_REPORT.md`'s "Agent compute cost" section for the combined total alongside the $16.02 infra spend.
-
 ## Deliverables index
 
 See `README.md` for the full file index and rerun instructions. Summary: this writeup + `LIMITATIONS.md` (approach/tradeoffs, speaker-ID methodology, resumability/monitoring/bottleneck, known limitations), `PROCESSING_SUMMARY.md` (raw/usable hours, clip counts, yield, duration distribution, discard reasons), `COST_REPORT.md` (trial-run cost breakdown + at-scale estimate), `manifest_sample.jsonl` (60-row sample of the live manifest), this repo (processing code), and the processed dataset itself, browsable and downloadable with no credentials at `https://podcast-dataset-public.podcast-dataset-rocketsri.workers.dev/` (manifest directly at `.../v2/manifest/manifest.jsonl`; key layout in `README.md`).
