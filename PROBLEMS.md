@@ -419,3 +419,48 @@ from #12 and #13: the Docker/system log alone showed a clean restart loop
 with *no* error text anywhere -- only the separate application-log tab
 revealed the actual Python traceback and the deliberate `bootstrap.sh`
 abort.
+
+## 15. Same class of bug, one dependency deeper: unpinned huggingface_hub broke pyannote's own hf_hub_download call
+
+**Problem.** Right after the #14 fix shipped, shard-4's restart loop
+changed shape but didn't stop: `bootstrap.sh` now passed its import check
+("`[bootstrap] python deps OK`") and `run_pipeline.py` actually started
+for the first time -- progress -- but it then crashed within ~2 seconds,
+every cycle:
+```
+File ".../pyannote/audio/core/pipeline.py", line 90, in from_pretrained
+    config_yml = hf_hub_download(...)
+File ".../huggingface_hub/utils/_validators.py", line 88, in _inner_fn
+    return fn(*args, **kwargs)
+TypeError: hf_hub_download() got an unexpected keyword argument 'use_auth_token'
+```
+
+**Root cause.** Identical mechanism to #14, one level further down the
+dependency tree: `requirements.txt` never pinned `huggingface_hub` at
+all, so pip resolved it to the newest release (`1.21.0`). `pyannote.audio`
+3.3.2's own internal code (`pipeline.py:90`) still calls
+`hf_hub_download(..., use_auth_token=hf_token)` -- an argument name
+`huggingface_hub` has since removed in favor of `token`. Pinning the
+direct dependencies (`torch`/`torchaudio`) wasn't enough; any transitive
+dependency pyannote.audio touches at runtime without us pinning it is
+just as free to drift to an incompatible newer release.
+
+**Fix.** Added an explicit `huggingface_hub==0.25.2` pin to
+`requirements.txt` (the last release before the `use_auth_token` removal).
+Verified locally first, without needing a GPU: installed
+`huggingface_hub==0.25.2` alone in a throwaway venv and called
+`hf_hub_download(..., use_auth_token=...)` against a fake repo -- it
+raised a normal `RepositoryNotFoundError`, not a `TypeError`, confirming
+the kwarg is still accepted. Then ran `pip install --dry-run -r
+requirements.txt` (with the new pin appended) and confirmed it resolves
+clean with no version conflicts and without disturbing the `torch==2.5.1`
+/ `torchaudio==2.5.1` pins from #14. No pod action needed, same reasoning
+as #14: the next automatic restart re-clones the branch and picks up the
+new pin.
+
+**Takeaway.** A library pinned to an exact version (`pyannote.audio==
+3.3.2`) is only as stable as *its own* unpinned dependencies -- pinning
+the direct, obviously-relevant package (torch) doesn't protect against
+every other transitive dependency it calls into at runtime. Worth
+auditing the rest of pyannote.audio's dependency tree the same way before
+assuming this class of bug is fully closed.
