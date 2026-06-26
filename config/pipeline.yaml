@@ -34,6 +34,7 @@ quality:
   music_spectral_flatness_floor: 0.35   # heuristic, weakest filter — see LIMITATIONS.md
   low_asr_confidence_no_speech_prob: 0.6
   low_asr_confidence_avg_logprob: -1.2
+  catastrophic_avg_logprob_floor: -2.0   # standalone OR trigger, independent of no_speech_prob -- see quality.py docstring and PROBLEMS.md #20
   ad_heuristic_spectral_flatness_floor: 0.20   # heuristic only, deliberately weaker than music_spectral_flatness_floor -- see LIMITATIONS.md
   ad_heuristic_no_speech_prob_floor: 0.35
   intro_outro_window_seconds: 30.0

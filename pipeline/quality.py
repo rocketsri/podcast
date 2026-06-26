@@ -15,7 +15,10 @@ at the first match -- a clip only ever gets one discard_reason, the earliest
 | silence_or_low_energy | RMS dBFS floor (catches VAD false positives); WADA-SNR-style    | heuristic                          |
 | overlap_detected      | distance from nearest crosstalk region vs edge-trim tolerance    | automated mask + heuristic trim    |
 | low_asr_confidence    | whisper no_speech_prob AND avg_logprob both bad (neither alone   | automated signal, heuristic combo  |
-|                       | is trusted as a sole trigger)                                    |                                     |
+|                       | is trusted as a sole trigger) OR avg_logprob alone past a far     |                                     |
+|                       | more extreme floor (catches wrong-language hallucination, where  |                                     |
+|                       | no_speech_prob stays low because real speech IS present -- see   |                                     |
+|                       | PROBLEMS.md #19)                                                  |                                     |
 | music_detected        | spectral flatness corroborated by whisper no_speech_prob          | heuristic, weakest filter          |
 | intro_outro_position  | first/last N seconds of episode + spectral/no_speech corroboration| heuristic                          |
 | ad_segment_heuristic  | weaker spectral-flatness + no_speech_prob combo, anywhere in ep   | heuristic only, least reliable     |
@@ -102,10 +105,13 @@ def evaluate_clip_discard_reason(
     if _overlap_edge_distance(start, end, overlap_intervals) < cfg.overlap_edge_trim_seconds:
         return "overlap_detected"
 
-    if (
-        no_speech_prob is not None and avg_logprob is not None
-        and no_speech_prob > cfg.low_asr_confidence_no_speech_prob
-        and avg_logprob < cfg.low_asr_confidence_avg_logprob
+    if avg_logprob is not None and (
+        (
+            no_speech_prob is not None
+            and no_speech_prob > cfg.low_asr_confidence_no_speech_prob
+            and avg_logprob < cfg.low_asr_confidence_avg_logprob
+        )
+        or avg_logprob < cfg.catastrophic_avg_logprob_floor
     ):
         return "low_asr_confidence"
 
