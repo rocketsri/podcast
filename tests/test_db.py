@@ -308,6 +308,50 @@ def test_list_failed_episodes_excludes_non_failed(conn):
     assert db.list_failed_episodes(conn, shard=None) == []
 
 
+# --- list_stalled_episodes -----------------------------------------------------
+
+
+def test_list_stalled_episodes_picks_up_arbitrary_mid_pipeline_stage(conn):
+    # Simulates a process killed externally (pod crash/restart) mid-episode:
+    # stage sits at some intermediate value with no exception ever raised,
+    # so mark_stage_failed never ran -- list_queued/list_failed must both
+    # miss it, and list_stalled_episodes must be the one that catches it.
+    db.insert_podcast(conn, "pod1", "feed1", "P", "https://example.com/feed.xml")
+    db.insert_episode(conn, "ep_stuck", "pod1", "pi-1", "A", "https://x/a.mp3")
+    db.advance_stage(conn, "ep_stuck", "asr_running")
+
+    assert db.list_queued_episodes(conn, shard=None) == []
+    assert db.list_failed_episodes(conn, shard=None) == []
+    stalled = db.list_stalled_episodes(conn, shard=None)
+    assert {row["episode_id"] for row in stalled} == {"ep_stuck"}
+
+
+def test_list_stalled_episodes_excludes_queued_failed_and_done(conn):
+    db.insert_podcast(conn, "pod1", "feed1", "P", "https://example.com/feed.xml")
+    db.insert_episode(conn, "ep_queued", "pod1", "pi-1", "A", "https://x/a.mp3")
+    db.insert_episode(conn, "ep_failed", "pod1", "pi-2", "B", "https://x/b.mp3")
+    db.insert_episode(conn, "ep_done", "pod1", "pi-3", "C", "https://x/c.mp3")
+    db.mark_stage_failed(conn, "ep_failed", "downloading", "err")
+    db.advance_stage(conn, "ep_done", "done")
+
+    assert db.list_stalled_episodes(conn, shard=None) == []
+
+
+def test_list_stalled_episodes_filters_by_shard(conn):
+    db.insert_podcast(conn, "pod1", "feed1", "P", "https://example.com/feed.xml")
+    db.insert_episode(conn, "ep_a", "pod1", "pi-1", "A", "https://x/a.mp3")
+    db.insert_episode(conn, "ep_b", "pod1", "pi-2", "B", "https://x/b.mp3")
+    db.set_assigned_shard(conn, "ep_b", 5)
+    db.advance_stage(conn, "ep_a", "diarizing")
+    db.advance_stage(conn, "ep_b", "diarizing")
+
+    no_shard = db.list_stalled_episodes(conn, shard=None)
+    assert {row["episode_id"] for row in no_shard} == {"ep_a"}
+
+    shard5 = db.list_stalled_episodes(conn, shard=5)
+    assert {row["episode_id"] for row in shard5} == {"ep_b"}
+
+
 # --- cost_events ---------------------------------------------------------------
 
 

@@ -424,12 +424,15 @@ def _push_heartbeat(ctx: RunContext) -> None:
 
 
 def run_queue(ctx: RunContext, shard: int | None = None, max_episodes: int | None = None) -> dict:
-    """Main per-pod driver loop: claims this pod's failed-then-queued
-    episodes (failed first, since resume_stage picks up from the failure
-    point rather than restarting from queued), checks budget/time caps
-    before each new episode, and records a cost checkpoint + heartbeat after
-    every one. Never raises on a single episode's failure -- see
-    process_episode."""
+    """Main per-pod driver loop: claims this pod's failed-then-stalled-then-
+    queued episodes (in that order, since resume_stage/skip-guards let each
+    pick up from wherever it left off rather than restarting from scratch),
+    checks budget/time caps before each new episode, and records a cost
+    checkpoint + heartbeat after every one. Never raises on a single
+    episode's failure -- see process_episode. "Stalled" (db.list_stalled_episodes)
+    covers a process killed externally mid-stage (pod crash/restart) with no
+    Python exception ever raised -- those episodes would otherwise be stuck
+    forever, matching neither the failed nor queued query."""
     pod_started_iso = db.get_run_meta(ctx.conn, "pod_started_at")
     if pod_started_iso is None:
         pod_started_iso = db.now_iso()
@@ -449,7 +452,11 @@ def run_queue(ctx: RunContext, shard: int | None = None, max_episodes: int | Non
     _snapshot_db_to_r2(ctx)
     _sync_log_to_r2(ctx)
 
-    episodes = list(db.list_failed_episodes(ctx.conn, shard=shard)) + list(db.list_queued_episodes(ctx.conn, shard=shard))
+    episodes = (
+        list(db.list_failed_episodes(ctx.conn, shard=shard))
+        + list(db.list_stalled_episodes(ctx.conn, shard=shard))
+        + list(db.list_queued_episodes(ctx.conn, shard=shard))
+    )
     if max_episodes is not None:
         episodes = episodes[:max_episodes]
 
