@@ -565,3 +565,74 @@ check of the rest of the RunPod base image's default env (`env | grep
 HF_\|TRANSFORMERS_\|TORCH_` on a fresh pod, not yet done) for any other
 opt-in-by-default behavior our minimal `requirements.txt` doesn't
 actually satisfy.
+
+## 18. R2 heartbeat never lands, even though the pipeline itself is healthy
+
+**Problem.** After #16/#17 were fixed and all 6 shards restarted, real
+episodes were processing correctly -- confirmed directly by curling each
+pod's exposed status HTTP port (`https://<runpod-id>-8080.proxy.runpod.net/`,
+the `ports=["8080/http"]` `scripts/bootstrap_pod.py` already opens but
+nothing in this repo had ever actually queried): all 6 shards showed real
+`done` episode counts and hundreds of uploaded clips each. But
+`scripts/poll_status.py` -- the only monitoring path anyone would normally
+use, since it reads the R2 heartbeat object -- reported "no heartbeat in
+R2 yet" for every shard the entire time. Confirmed directly with a
+throwaway script hitting R2 for `status/podcast-shard-{0..5}.json`: all
+six keys genuinely do not exist.
+
+**Root cause -- partially identified, not fully.** `_push_heartbeat()`
+(`pipeline/pipeline_runner.py`) wraps the R2 write
+(`heartbeat.push_status_to_r2`) in a bare `try/except Exception:
+logger.exception(...)`, so a failing write was silently swallowed with no
+trace anywhere reachable without pod log/SSH access (which this
+architecture doesn't have). Clip uploads use the identical
+`ctx.storage_client`/`ctx.bucket` pair and the identical non-None guard,
+and those succeed, so the credentials/client/bucket are not the problem.
+Reproducing the exact call (`storage.put_json` to the same `status/`
+prefix, same bucket, same credentials from `.env`) succeeded both against
+this sandbox's system boto3 (1.43.36) and -- to rule out a version-drift
+explanation matching #14/#17's pattern -- against a venv with the exact
+pinned `boto3==1.35.99`/`botocore==1.35.99` the pods actually run. Neither
+reproduces the failure, so whatever is actually throwing inside
+`push_status_to_r2` on the live pods is still unknown; this is a real gap
+in this entry, not a closed one.
+
+**Fix (so far).** Made the failure observable instead of guessing at a
+root cause with no evidence: `_push_heartbeat()` now stashes
+`f"{type(exc).__name__}: {exc}"` into the status dict itself under
+`heartbeat_r2_push_error` before assigning it to `ctx.latest_status`
+(moved the assignment to after the try/except). The local HTTP status
+channel was already being served from `ctx.latest_status` and is already
+reachable externally via the RunPod port-8080 proxy, so the next pod
+restart will surface the real exception there even though the R2 object
+that should have carried the same detail is exactly what's failing to
+write. Also moved the first `_push_heartbeat()` call to the top of
+`run_queue()`, before the episode loop: previously a heartbeat was only
+pushed *after* a full episode finished (download + VAD + diarize + ASR +
+export, easily 10-30+ minutes for a real episode), so for that entire
+window R2/poll_status.py couldn't distinguish "still working on episode
+1" from "crash-looped before models even loaded" -- both look identical
+(no heartbeat object, RunPod status RUNNING). Verified both changes with
+a standalone script: a `RunContext` with a storage client that always
+raises confirms `run_queue()` with zero queued episodes still pushes one
+heartbeat immediately and that the captured exception text lands in
+`ctx.latest_status["heartbeat_r2_push_error"]` without crashing the run.
+
+Did not restart the live pods to pick this up -- they're mid-run
+producing real clips successfully despite the broken heartbeat, and a
+restart (even though `run_queue` resumes failed/queued episodes rather
+than losing progress) is exactly the kind of pod-state-changing action
+that needs an explicit go-ahead rather than being done opportunistically
+while chasing a monitoring-only bug.
+
+**Takeaway.** A "redundant" fallback channel (the local HTTP status
+server, justified in `heartbeat.py`'s own docstring as insurance "since a
+status check shouldn't depend solely on R2 write success") is only
+actually redundant if something *reads* it. Nothing in this repo did --
+`poll_status.py` only ever checked R2 -- so the fallback's only practical
+value during this incident was that I happened to know the port was
+exposed and could curl it by hand. A bare `except Exception:
+logger.exception(...)` with no surfaced detail is functionally a silent
+failure in any environment without log access, regardless of intent;
+swallowed exceptions need to leave a trace somewhere a caller without
+shell access can actually see, not just in a log file nothing reads.

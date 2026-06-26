@@ -2,15 +2,29 @@
 
 RunPod's API exposes no container-log retrieval, so the only operational
 visibility into a pod is what it self-reports: pipeline/heartbeat.py pushes
-a status JSON to R2 (storage.status_key(pod_id)) after every episode. This
-script cross-references RunPod's own pod lifecycle state (list_pods, keyed
-by the `name` bootstrap_pod.py set to each pod's heartbeat pod_id label)
-against the latest heartbeat each pod has pushed, and flags:
-  - pods RunPod reports running but with no heartbeat object in R2 yet
-    (still installing deps / downloading the code tarball)
+a status JSON to R2 (storage.status_key(pod_id)) after every episode, and
+also serves the same dict over HTTP on the port bootstrap_pod.py exposes
+via RunPod's proxy (config.monitoring.status_http_port, default 8080 --
+reachable at https://<runpod-pod-id>-<port>.proxy.runpod.net/). The R2
+write and the HTTP serve are independent (see PROBLEMS.md #18: an R2-write
+failure left every shard's R2 heartbeat permanently missing while the HTTP
+endpoint reported real progress the whole time) -- this script used to
+read only R2, which made that whole class of failure indistinguishable
+from "still bootstrapping". It now falls back to the HTTP endpoint
+whenever R2 has nothing, instead of treating "no R2 object" as the only
+signal.
+
+This script cross-references RunPod's own pod lifecycle state (list_pods,
+keyed by the `name` bootstrap_pod.py set to each pod's heartbeat pod_id
+label) against the latest heartbeat each pod has reported by either
+channel, and flags:
+  - pods RunPod reports running but with no heartbeat from either channel
+    (still installing deps / downloading the code tarball / loading models)
   - pods whose last heartbeat is older than config.monitoring's
     stale_heartbeat_minutes (likely crashed or hung)
-  - any pod whose latest heartbeat carries a last_error
+  - any pod whose latest heartbeat carries a last_error or a
+    heartbeat_r2_push_error (the R2 write itself is failing even though
+    the HTTP fallback got through)
 
 Exits non-zero if any pod is stale or RunPod reports it EXITED/terminated
 unexpectedly, so this can be used as a cheap watch-loop condition.
@@ -24,6 +38,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import requests
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -31,6 +47,12 @@ from pipeline import config, db, heartbeat, logging_utils, storage  # noqa: E402
 from pipeline.runpod_client import RunPodClient, RunPodError  # noqa: E402
 
 logger = logging_utils.get_logger()
+
+HTTP_STATUS_TIMEOUT = 8.0
+
+
+def proxy_status_url(runpod_pod_id: str, port: int) -> str:
+    return f"https://{runpod_pod_id}-{port}.proxy.runpod.net/"
 
 
 def parse_iso(ts: str) -> datetime:
@@ -42,6 +64,17 @@ def fetch_heartbeat(client, bucket: str, pod_id_label: str) -> dict | None:
     try:
         return storage.get_json(client, bucket, storage.status_key(pod_id_label))
     except Exception:  # noqa: BLE001 - missing object, network blip, etc. -- just means "no heartbeat yet"
+        return None
+
+
+def fetch_heartbeat_via_http(runpod_pod_id: str, port: int) -> dict | None:
+    """Fallback for when the R2 object is missing -- hits the same status
+    dict directly over RunPod's exposed proxy port (see PROBLEMS.md #18)."""
+    try:
+        resp = requests.get(proxy_status_url(runpod_pod_id, port), timeout=HTTP_STATUS_TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
+    except (requests.exceptions.RequestException, ValueError):
         return None
 
 
@@ -80,19 +113,26 @@ def main(argv: list[str] | None = None) -> int:
     any_problem = False
     for pod in pods:
         pod_id_label = pod.get("name", "?")
+        runpod_id = pod.get("id", "?")
         runpod_status = pod.get("desiredStatus") or pod.get("status") or "?"
         hb = fetch_heartbeat(r2_client, secrets.r2_bucket_name, pod_id_label)
+        via_http = False
+        if hb is None and runpod_id != "?":
+            hb = fetch_heartbeat_via_http(runpod_id, cfg.monitoring.status_http_port)
+            via_http = hb is not None
 
-        print(f"--- {pod_id_label} (runpod id={pod.get('id', '?')}, runpod status={runpod_status}) ---")
+        print(f"--- {pod_id_label} (runpod id={runpod_id}, runpod status={runpod_status}) ---")
         if hb is None:
-            print("  no heartbeat in R2 yet (still bootstrapping, or never started)")
+            print("  no heartbeat in R2 or via HTTP fallback (still bootstrapping, loading models, or never started)")
             if runpod_status not in ("RUNNING", "PENDING", "?"):
                 any_problem = True
             continue
+        if via_http:
+            print("  [via HTTP fallback -- R2 object missing, see PROBLEMS.md #18]")
 
         age = now - parse_iso(hb["updated_at"])
         stale = age > stale_threshold
-        any_problem = any_problem or stale or hb.get("last_error") is not None
+        any_problem = any_problem or stale or hb.get("last_error") is not None or hb.get("heartbeat_r2_push_error") is not None
 
         eps = hb["episodes"]
         print(f"  heartbeat age: {age.total_seconds() / 60:.1f}m{'  [STALE]' if stale else ''}")
@@ -101,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  usable hours: {hb['usable_seconds_total'] / 3600.0:.2f}h  cost so far: ${hb['total_cost_usd']:.2f}")
         if hb.get("last_error"):
             print(f"  last_error: {hb['last_error']}")
+        if hb.get("heartbeat_r2_push_error"):
+            print(f"  heartbeat_r2_push_error: {hb['heartbeat_r2_push_error']}")
 
     print()
     print("OK -- all pods reporting" if not any_problem else "PROBLEM -- see [STALE]/last_error/unexpected-status lines above")

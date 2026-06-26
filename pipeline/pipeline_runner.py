@@ -368,12 +368,19 @@ def _record_gpu_compute_checkpoint(ctx: RunContext, pod_started_at: datetime.dat
 def _push_heartbeat(ctx: RunContext) -> None:
     pod_started_at = db.get_run_meta(ctx.conn, "pod_started_at", db.now_iso())
     status = heartbeat.build_status(ctx.conn, ctx.pod_id, ctx.shard_id, pod_started_at)
-    ctx.latest_status = status  # StatusServer's status_provider reads this directly
     if ctx.storage_client is not None and ctx.bucket is not None:
         try:
             heartbeat.push_status_to_r2(ctx.storage_client, ctx.bucket, ctx.pod_id, status)
-        except Exception:
+        except Exception as exc:
+            # Swallowing this exception used to leave the R2 push's own failure mode
+            # completely invisible -- poll_status.py only reads R2, so a pod whose R2
+            # write was silently failing looked identical (no R2 object, RunPod status
+            # RUNNING) to one still bootstrapping. Stash it in the status dict itself so
+            # the redundant local HTTP channel (still updated below) surfaces *why*, even
+            # though the R2 write that should have carried this same detail just failed.
             logger.exception("heartbeat push to R2 failed -- continuing (local HTTP status channel still serves it)")
+            status["heartbeat_r2_push_error"] = f"{type(exc).__name__}: {exc}"
+    ctx.latest_status = status  # StatusServer's status_provider reads this directly
 
 
 def run_queue(ctx: RunContext, shard: int | None = None, max_episodes: int | None = None) -> dict:
@@ -390,6 +397,15 @@ def run_queue(ctx: RunContext, shard: int | None = None, max_episodes: int | Non
     pod_started_at = datetime.datetime.fromisoformat(pod_started_iso)
 
     costs.record_egress(ctx.conn)  # measured-zero, once per run start (see costs.record_egress)
+
+    # Heartbeat was previously only pushed after a full episode finished --
+    # for a real podcast episode (model load + download + VAD + diarize + ASR
+    # + clip export) that can be 10-30+ minutes, so R2/poll_status.py stayed
+    # completely blind for that whole window with no way to tell "still
+    # working on episode 1" apart from "crash-looped before models even
+    # loaded". Push one right away so pod restart/startup is visible
+    # immediately.
+    _push_heartbeat(ctx)
 
     episodes = list(db.list_failed_episodes(ctx.conn, shard=shard)) + list(db.list_queued_episodes(ctx.conn, shard=shard))
     if max_episodes is not None:
