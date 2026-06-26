@@ -187,3 +187,65 @@ without re-deriving it from raw clips/transcripts. This is exactly the
 signature problem #5 exhibited (96-97% dominance across 2 detected labels)
 and would have surfaced it automatically, per-episode, during the run
 instead of requiring a manual audit afterward.
+
+## 10. Local disk usage grew unboundedly -- raw/wav/clip files were never deleted after upload
+
+**Problem.** While the 6 pods were running, RunPod's console showed
+divergent container-disk usage across pods that had been alive for
+comparable wall-clock time (one pod noticeably higher than the rest). This
+contradicts `PLAN.md`'s stated design assumption that "per-pod local disk
+stays bounded regardless of total corpus size because raw audio is
+processed-and-deleted per episode."
+
+**Root cause.** That sentence described the *intended* design but was never
+actually implemented. `pipeline_runner.py`'s `_ensure_downloaded()` writes
+the raw download to `work/raw/{episode_id}{suffix}`, `_ensure_transcoded()`
+writes a 16kHz mono wav to `work/wav/{episode_id}.wav`, and
+`_ensure_exported_and_uploaded()` writes every surviving clip to
+`work/clips/{podcast_id}/{episode_id}/{clip_id}.flac` -- and nothing in
+`pipeline_runner.py`, `ingest.py`, `audio.py`, or `storage.py` ever deleted
+any of these three file categories afterward, even once a clip was
+confirmed uploaded to R2. Every pod's local disk grows by roughly one raw
+file + one transcoded wav + one flac per surviving clip, *per episode,
+forever*, against a fixed 30GB `containerDiskInGb` pod quota -- on a 24h
+run each pod's `select_podcasts_free.py` queues against the full
+150-200-raw-hour `target_corpus` target (not divided across pods, see
+problem #8), so a pod that actually got through dozens of episodes would
+eventually exhaust its disk and crash outright (not a graceful
+checkpoint-and-resume failure -- RunPod doesn't restart a container whose
+process exited).
+
+**Fix.** `_ensure_transcoded()` now deletes the raw file immediately after
+a successful transcode (confirmed via grep that nothing downstream of that
+stage ever reads `local_raw_path` again). `_ensure_exported_and_uploaded()`
+now deletes the episode's transcoded wav once the episode reaches "done"
+(nothing reads `local_wav_path` past that point either), and removes the
+episode's local clip-flac directory too, but only when a real R2
+`storage_client` is configured -- in local-only/dev mode (no R2
+credentials) the local flac files are the actual deliverable and must
+stay. Both deletions sit after the stage that needs the file already
+succeeded, so a pod that crashes mid-episode and resumes still finds the
+raw/wav file it needs for the stage it's resuming into -- only a *fully
+done* episode's intermediate files are freed.
+
+## 11. First episode per pod was picked for hour-target efficiency, not fast feedback
+
+**Problem.** 30+ minutes into the run, R2 still had 0 completed
+episodes/clips across all 6 pods, with no way yet to confirm the live GPU
+path actually works end-to-end. Looked like it could just be slow, but it
+also risked masking a real failure behind a very long first episode.
+
+**Root cause.** `select_podcasts_free.py` selects podcasts
+longest-average-duration-first (deliberately, to hit the 150-200-raw-hour
+target with fewer podcasts to manage), and `db.list_queued_episodes()`
+claimed episodes in `episode_id` (insertion) order -- so a pod's very
+first episode was likely to be one of the longest in its whole queue,
+which is the worst case both for getting a fast pipeline-works/doesn't-work
+signal and for banking any usable hours early in the 24h window.
+
+**Fix.** `list_queued_episodes()` now orders by
+`duration_seconds_reported ASC` (NULLs last) instead of `episode_id` --
+same selected episode set, but pods claim their shortest known episodes
+first. This only takes effect for a queue fetched after this change (i.e.
+a fresh `run_pipeline.py` start), so applying it to already-running pods
+requires relaunching them.
