@@ -305,3 +305,55 @@ repeated on every future relaunch until logs were manually pulled and
 read by a human, since no telemetry channel available to this session
 (GraphQL runtime stats, R2 heartbeat) can distinguish a crash loop from a
 slow-but-healthy boot.
+
+## 13. One pod landed on a RunPod host with an incompatible GPU driver -- a hardware issue, not a code bug
+
+**Problem.** After the #12 fix was deployed to all 6 relaunched pods,
+direct RunPod GraphQL polling showed `podcast-shard-5` flat at exactly 0%
+CPU and 0% GPU across multiple polls 30+ seconds apart, with zero monitor
+notifications since launch -- while shards 0-4 all showed at least brief
+CPU activity in the same window. The user independently corroborated this
+from the RunPod console: shard-5 showed 0% disk used, while shards 0-4
+were at 29-36%. This looked at first like it could be a recurrence of
+#12, so the pod was restarted (RunPod REST `POST /pods/{id}/restart`) as
+a low-cost first attempt.
+
+**Root cause.** The restart did not help, and the user pulled shard-5's
+actual container logs, which showed the real cause: the container never
+started at all, at the Docker/OCI level, before `infra/bootstrap.sh` (or
+any application code) ever ran:
+```
+error starting container: ... OCI runtime create failed: runc create
+failed: ... nvidia-container-cli: requirement error: unsatisfied
+condition: cuda>=12.8, please update your driver to a newer version, or
+use an earlier cuda container: unknown
+```
+The `runpod/pytorch:1.0.7-cu1281-torch271-ubuntu2204` image requires
+CUDA >= 12.8, but the specific physical host this pod was scheduled onto
+(RunPod Community Cloud, `machineId x3fo8pyehccc`) had an older NVIDIA
+driver that doesn't satisfy that. Docker retried container creation
+every ~16 seconds, continuously, from pod creation through at least 13+
+minutes later with zero self-recovery -- explaining the flat 0%
+CPU/GPU/disk: there was never a running process to measure. This is a
+**host/hardware incompatibility**, entirely outside this repo's code --
+no edit to `infra/bootstrap.sh`, `requirements.txt`, or anything else
+in-repo could have prevented or fixed it. It is also why the restart
+didn't help: restarting a pod via the RunPod API keeps it pinned to the
+same physical machine, and the machine's driver was the broken part.
+
+**Fix.** Terminated the affected pod and created a brand new one in its
+place with the same shard config (`bootstrap_pod.py --num-pods 1
+--shard-offset 5 --confirm`) so RunPod would schedule it onto a
+different host. Confirmed via GraphQL (`machineId`) that the new pod
+landed on a different machine than the broken one before considering it
+resolved.
+
+**Takeaway.** Community Cloud hosts are operator-owned and can have
+stale drivers; a single bad host is a real, if infrequent, possibility
+and looks identical from the outside to a slow-but-healthy boot (zero
+CPU/GPU/disk activity, no logs reaching any telemetry channel this
+session has API access to) until real container logs are pulled. The
+diagnostic signature that distinguished it from #12: *zero* lines ever
+appear in the container's logs at all (not even the first `[bootstrap]`
+echo), because the failure is at container creation, a layer below
+where `bootstrap.sh` runs.
