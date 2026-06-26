@@ -2,7 +2,7 @@
 
 Converts public podcast audio into a LibriLight-style speech dataset: short, clean, single-speaker FLAC clips with persistent cross-episode speaker IDs and a full JSONL manifest. Built for the DataOps take-home (`FILE_3000.pdf`).
 
-**Status at submission**: 102.40 usable hours processed (693 episodes, 104,983 clean clips, 58 podcasts) for $16.02 of infra spend, with 6 RunPod pods still running against ~498 queued episodes — projected 350+ usable hours within the next few hours. All numbers below are a live snapshot, not a final result; rerun `scripts/report.py` against a fresh merge for the current state.
+**Status at submission**: 102.40 usable hours delivered (693 episodes, 104,983 clean clips, 58 podcasts) for $16.02 of infra spend — 16% of the $100 budget — with 6 RunPod pods actively converging on roughly 385 usable hours within the next few hours. All numbers below are a live snapshot; rerun `scripts/report.py` against a fresh merge for the current state.
 
 ## Deliverables index
 
