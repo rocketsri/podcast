@@ -39,7 +39,10 @@ from pipeline.runpod_client import RunPodClient, RunPodError  # noqa: E402
 logger = logging_utils.get_logger()
 
 NETWORK_CHECK_TIMEOUT = 10.0
-GATED_MODEL_ID = "pyannote/speaker-diarization-3.1"
+# Both are gated and both are actually fetched inside Pipeline.from_pretrained() --
+# speaker-diarization-3.1 is the top-level checkpoint, segmentation-3.0 is the
+# sub-model it loads internally for the segmentation step.
+GATED_MODEL_IDS = ["pyannote/speaker-diarization-3.1", "pyannote/segmentation-3.0"]
 
 
 @dataclass
@@ -98,19 +101,24 @@ def check_huggingface(secrets: config.EnvSecrets) -> CheckResult:
     if not secrets.hf_token:
         return CheckResult("huggingface", False, "HF_TOKEN not set")
     try:
-        from huggingface_hub import HfApi
+        from huggingface_hub import hf_hub_download, HfApi
         from huggingface_hub.utils import HfHubHTTPError
 
         api = HfApi()
         who = api.whoami(token=secrets.hf_token)
-        try:
-            api.model_info(GATED_MODEL_ID, token=secrets.hf_token)
-        except HfHubHTTPError as exc:
-            return CheckResult(
-                "huggingface", False,
-                f"token valid (user={who.get('name')}) but gated model access failed for "
-                f"{GATED_MODEL_ID} -- accept the license at https://huggingface.co/{GATED_MODEL_ID}: {exc}",
-            )
+        for repo_id in GATED_MODEL_IDS:
+            try:
+                # model_info() only reads repo metadata and succeeds even when the
+                # gated-access agreement hasn't been accepted; an actual file fetch
+                # (what Pipeline.from_pretrained() really does) is the only call
+                # that enforces the gate, so check with that instead.
+                hf_hub_download(repo_id, "config.yaml", token=secrets.hf_token)
+            except HfHubHTTPError as exc:
+                return CheckResult(
+                    "huggingface", False,
+                    f"token valid (user={who.get('name')}) but gated model access failed for "
+                    f"{repo_id} -- accept the license at https://huggingface.co/{repo_id}: {exc}",
+                )
         return CheckResult("huggingface", True, f"token valid (user={who.get('name')}), gated model access confirmed")
     except Exception as exc:  # noqa: BLE001 - surface any hf_hub error as a failed check, not a crash
         return CheckResult("huggingface", False, str(exc))

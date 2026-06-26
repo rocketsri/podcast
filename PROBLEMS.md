@@ -464,3 +464,64 @@ the direct, obviously-relevant package (torch) doesn't protect against
 every other transitive dependency it calls into at runtime. Worth
 auditing the rest of pyannote.audio's dependency tree the same way before
 assuming this class of bug is fully closed.
+
+## 16. Gated HF model access was never actually granted -- and smoke_test.py's own check gave a false "confirmed"
+
+**Problem.** Acting on "look for all possible problems like this and fix
+them," audited the rest of the model-loading chain locally (CPU venv,
+exact pinned `requirements.txt`, actually *calling* `vad.load_model()`,
+`diarize.load_pipeline()`, and `asr.load_model()` rather than just
+importing). `vad` and `asr` (faster-whisper/ctranslate2/tokenizers) both
+loaded and ran clean -- no further version-drift bugs there. `diarize`
+failed, but not with a version error:
+```
+GatedRepoError: 403 Client Error ... Cannot access gated repo for url
+https://huggingface.co/pyannote/speaker-diarization-3.1/resolve/main/config.yaml.
+Access to model pyannote/speaker-diarization-3.1 is restricted and you
+are not in the authorized list.
+```
+The same failure reproduces for `pyannote/segmentation-3.0`, the gated
+sub-model `Pipeline.from_pretrained()` loads internally for the
+segmentation step. Both confirmed with the exact `HF_TOKEN` from `.env`
+-- the same token every pod uses -- so every one of the 6 shards is
+blocked here regardless of the #14/#15 fixes.
+
+Worse: `scripts/smoke_test.py`'s `check_huggingface()` had already been
+run earlier in the project and reported `[OK] huggingface: token valid
+(user=rocketsri), gated model access confirmed` -- a false positive that
+likely gave false confidence before the pods were ever launched.
+
+**Root cause.** `check_huggingface()` validated gated access with
+`HfApi.model_info(GATED_MODEL_ID, token=...)`. `model_info()` only reads
+repo *metadata* (it returns fine even with `gated: "auto"` info) and does
+not enforce the per-user gate -- confirmed directly: `model_info()`
+succeeds with this exact token, but `hf_hub_download()` of an actual file
+from the same repo, with the same token, 403s. The gate is only enforced
+on real file fetches, which is exactly what `Pipeline.from_pretrained()`
+needs and what the smoke test should have exercised instead of a
+metadata-only call.
+
+**Fix.** Changed `check_huggingface()` to call `hf_hub_download(repo_id,
+"config.yaml", token=...)` against both gated repos actually used
+(`pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0`)
+instead of `model_info()`. Re-ran the smoke test: it now correctly
+reports `[FAIL] huggingface: token valid (user=rocketsri) but gated model
+access failed for pyannote/speaker-diarization-3.1 -- accept the license
+at https://huggingface.co/pyannote/speaker-diarization-3.1`.
+
+This part requires action from whoever holds the `rocketsri` HF account
+tied to `HF_TOKEN` -- visit and accept the user-conditions agreement
+(logged in as that account) on:
+  - https://huggingface.co/pyannote/speaker-diarization-3.1
+  - https://huggingface.co/pyannote/segmentation-3.0
+Both show `gated: "auto"`, meaning access is granted immediately on
+accepting, no manual repo-owner review wait. No code or pin can substitute
+for this step.
+
+**Takeaway.** A metadata-only HF API call (`model_info`,
+`list_repo_files`, etc.) is not a valid proxy for "can this token actually
+download this gated file" -- gated-repo enforcement in `huggingface_hub`
+0.25.2 only triggers on the real download path. Any future
+connectivity/smoke check for gated content should exercise the same call
+the real code makes, not a cheaper-looking substitute that happens to
+return 200/OK for an unrelated reason.
