@@ -9,7 +9,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from pipeline import asr, config, db, diarize, heartbeat, logging_utils, pipeline_runner, storage, vad
+from pipeline import asr, backfill, config, db, diarize, heartbeat, logging_utils, pipeline_runner, storage, vad
 
 logger = logging_utils.get_logger()
 
@@ -55,6 +55,19 @@ def main(argv: list[str] | None = None) -> int:
             bucket = secrets.r2_bucket_name
         except config.ConfigError as exc:
             logger.warning("R2 credentials incomplete (%s) -- running in local-only mode, clips stay on disk", exc)
+
+    if storage_client is not None and bucket is not None:
+        # Runs on every boot (including a plain restart_pod() of an
+        # already-running pod -- see pipeline/backfill.py's docstring for why
+        # that's the only way a code fix reaches a live pod here). Cheap
+        # no-op when there's nothing stale: only clips already flagged
+        # uploaded=1 with a local file still on disk are even considered.
+        result = backfill.backfill_uploaded_clips(conn, storage_client, bucket)
+        if result.candidates:
+            logger.info(
+                "startup backfill: %d candidate(s) checked, %d already in R2, %d re-uploaded, %d failed, %d unrecoverable (file gone)",
+                result.candidates, result.already_present, result.reuploaded, result.failed, result.missing,
+            )
 
     if db.get_run_meta(conn, "gpu_hourly_rate_usd") is None:
         db.set_run_meta(conn, "gpu_hourly_rate_usd", str(cfg.cost.assumed_gpu_hourly_usd))

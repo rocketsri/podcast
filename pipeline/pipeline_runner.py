@@ -295,6 +295,16 @@ def _ensure_exported_and_uploaded(ctx: RunContext, episode_row: sqlite3.Row) -> 
                 audio_path = storage.upload_clip(
                     ctx.storage_client, ctx.bucket, local_flac_path, podcast_id, episode_id, clip["clip_id"]
                 )
+                # upload_file() not raising is not sufficient evidence the bytes
+                # landed -- observed live on the RunPod fleet: every upload_file()
+                # call returned cleanly (and every heartbeat put_json() call too)
+                # while R2 stayed completely empty the whole run, almost certainly
+                # something on the pod's network path faking a 2xx instead of
+                # erroring. A real head_object check closes that gap before we
+                # trust the flag enough to ever delete the only copy.
+                key = storage.clip_key(podcast_id, episode_id, clip["clip_id"])
+                if not storage.object_exists(ctx.storage_client, ctx.bucket, key):
+                    raise RuntimeError(f"upload_file reported success for {key} but object_exists is False after")
                 uploaded_count += 1
             else:
                 audio_path = local_flac_path
