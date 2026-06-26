@@ -52,12 +52,22 @@ pip install --quiet -r requirements.txt
 
 mkdir -p work
 echo "[bootstrap] discovering episodes (free iTunes+RSS path, no PodcastIndex creds needed)..."
-# Different search terms than run_pipeline_local.py's CPU shards use (see
-# scripts/select_podcasts_free.py's DEFAULT_QUERIES) so this pod's GPU time
-# goes toward genuinely new episodes instead of re-processing audio the free
-# CPU path is already covering concurrently.
-python3 scripts/select_podcasts_free.py --db work/pipeline.db \
-    --queries "debate" "documentary" "science podcast interview" "history podcast" "panel discussion"
+# Each GPU pod's $SHARD gets a distinct query group so N pods launched
+# together don't all rediscover the same overlapping iTunes Search results
+# into separate dbs -- shard 0's list is what the first pod (already
+# running before this table existed) launched with, kept as-is here so a
+# restart of that pod still queues the same content; shards 1-5 cover
+# disjoint topics for --num-pods 5 --shard-offset 1.
+case "${SHARD:-0}" in
+    0) QUERIES=("debate" "documentary" "science podcast interview" "history podcast" "panel discussion") ;;
+    1) QUERIES=("true crime interview" "business podcast interview" "tech podcast interview" "comedy interview podcast" "sports talk show") ;;
+    2) QUERIES=("philosophy podcast" "psychology interview" "health podcast interview" "finance podcast interview" "education podcast interview") ;;
+    3) QUERIES=("news analysis podcast" "politics interview podcast" "culture podcast interview" "book podcast interview" "film podcast interview") ;;
+    4) QUERIES=("startup podcast interview" "music podcast interview" "religion podcast interview" "travel podcast interview" "food podcast interview") ;;
+    5) QUERIES=("self improvement podcast" "relationship podcast interview" "parenting podcast interview" "career podcast interview" "leadership podcast interview") ;;
+    *) QUERIES=("interview" "conversation" "talk show" "long form interview" "in depth conversation") ;;
+esac
+python3 scripts/select_podcasts_free.py --db work/pipeline.db --queries "${QUERIES[@]}"
 
 echo "[bootstrap] starting run_pipeline.py (pod_id=${POD_ID:-unset}, shard=${SHARD:-unset})..."
 exec python3 run_pipeline.py \

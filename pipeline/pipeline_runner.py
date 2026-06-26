@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import shutil
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -119,6 +120,10 @@ def _ensure_transcoded(ctx: RunContext, episode_row: sqlite3.Row) -> sqlite3.Row
         _fail(ctx.conn, episode_id, "transcoding", exc)
         raise StageFailure(str(exc)) from exc
     db.advance_stage(ctx.conn, episode_id, "transcoded", local_wav_path=str(wav_path))
+    # Raw download is never read again past this point (only this stage
+    # touches local_raw_path) -- free it now rather than letting every
+    # processed episode's raw file accumulate for the life of the pod.
+    Path(episode_row["local_raw_path"]).unlink(missing_ok=True)
     return db.get_episode(ctx.conn, episode_id)
 
 
@@ -179,6 +184,20 @@ def _ensure_diarized_and_clustered(ctx: RunContext, episode_row: sqlite3.Row) ->
         _fail(ctx.conn, episode_id, "diarizing", exc)
         raise StageFailure(str(exc)) from exc
     db.advance_stage(ctx.conn, episode_id, "diarized")
+
+    dominant = diarize.dominant_speaker_share(result.turns)
+    if dominant is not None:
+        label, share, num_labels = dominant
+        if num_labels >= 2 and share >= ctx.cfg.clustering.dominant_speaker_warn_threshold:
+            logger.warning(
+                "episode %s: diarization looks collapsed -- label %s holds %.1f%% of speech across "
+                "%d detected labels (>=%d%% threshold); likely a clustering/threshold problem, not a "
+                "genuinely solo episode -- see PROBLEMS.md",
+                episode_id, label, share * 100, num_labels, int(ctx.cfg.clustering.dominant_speaker_warn_threshold * 100),
+            )
+            db.set_run_meta(
+                ctx.conn, f"dominant_speaker_warning_{episode_id}", f"{label}:{share:.4f}:{num_labels}",
+            )
 
     try:
         label_to_speaker = cluster.ingest_episode_diarization(
@@ -286,6 +305,15 @@ def _ensure_exported_and_uploaded(ctx: RunContext, episode_row: sqlite3.Row) -> 
 
     usable_seconds = sum(c["duration_seconds"] for c in surviving)
     db.advance_stage(ctx.conn, episode_id, "done", usable_seconds=usable_seconds)
+
+    # Episode is fully done -- nothing downstream ever reads the transcoded
+    # wav again, so free it now instead of letting it sit on local disk for
+    # the rest of the pod's life. Local clip FLACs are likewise disposable
+    # once they've made it to R2 (uploaded_count tracks that); in local-only
+    # mode (no storage_client) they're the actual deliverable, so leave them.
+    Path(wav_path).unlink(missing_ok=True)
+    if ctx.storage_client is not None and ctx.bucket is not None:
+        shutil.rmtree(ctx.work_dir / "clips" / podcast_id / episode_id, ignore_errors=True)
 
 
 # --- per-episode + driver loop ----------------------------------------------

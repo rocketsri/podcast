@@ -98,6 +98,26 @@ def diarize(
     return DiarizationResult(turns=turns, embeddings=embeddings)
 
 
+def dominant_speaker_share(turns: list[SpeakerTurn]) -> tuple[str, float, int] | None:
+    """(label, share, num_labels) for the most-talkative local label by total
+    turn-seconds, or None if turns is empty. Cheap, model-agnostic guardrail
+    against clustering collapse (see PROBLEMS.md): a real multi-host
+    conversation essentially never has one label holding >90%+ of all
+    speech, so a high share alongside >=2 detected labels means the
+    diarization backend likely merged distinct speakers into one cluster
+    rather than that the episode is genuinely solo."""
+    totals: dict[str, float] = {}
+    for turn in turns:
+        totals[turn.local_label] = totals.get(turn.local_label, 0.0) + (turn.end_seconds - turn.start_seconds)
+    if not totals:
+        return None
+    total_seconds = sum(totals.values())
+    if total_seconds <= 0:
+        return None
+    label, seconds = max(totals.items(), key=lambda kv: kv[1])
+    return label, seconds / total_seconds, len(totals)
+
+
 def overlap_mask_seconds(turns: list[SpeakerTurn]) -> list[tuple[float, float]]:
     """Time ranges where >=2 distinct local speakers' turns overlap -- the
     crosstalk exclusion mask segment.py subtracts before clip candidates are

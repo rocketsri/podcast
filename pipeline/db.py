@@ -265,13 +265,25 @@ def get_episode(conn: sqlite3.Connection, episode_id: str) -> sqlite3.Row | None
 
 
 def list_queued_episodes(conn: sqlite3.Connection, shard: int | None = None) -> list[sqlite3.Row]:
-    """Episodes ready to claim. `shard=None` means the single-pod/Stage-1 case
-    (assigned_shard IS NULL); otherwise filters to that pod's own shard."""
+    """Episodes ready to claim, shortest-reported-duration first (NULLs
+    last) rather than insertion order. select_podcasts_free.py picks
+    podcasts longest-average-duration-first to hit the raw-hours target
+    efficiently, which would otherwise make a pod's very first episode one
+    of the longest available -- the worst case for getting a fast
+    correctness signal and some usable hours banked early in a 24h run.
+    Sorting the claim order (not the selection set) gets short episodes
+    processed first without changing which episodes get queued.
+    `shard=None` means the single-pod/Stage-1 case (assigned_shard IS
+    NULL); otherwise filters to that pod's own shard."""
     if shard is None:
-        query = "SELECT * FROM episodes WHERE stage = 'queued' AND assigned_shard IS NULL ORDER BY episode_id"
+        query = (
+            "SELECT * FROM episodes WHERE stage = 'queued' AND assigned_shard IS NULL "
+            "ORDER BY duration_seconds_reported IS NULL, duration_seconds_reported ASC"
+        )
         return conn.execute(query).fetchall()
     return conn.execute(
-        "SELECT * FROM episodes WHERE stage = 'queued' AND assigned_shard = ? ORDER BY episode_id",
+        "SELECT * FROM episodes WHERE stage = 'queued' AND assigned_shard = ? "
+        "ORDER BY duration_seconds_reported IS NULL, duration_seconds_reported ASC",
         (shard,),
     ).fetchall()
 

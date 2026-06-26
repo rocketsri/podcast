@@ -71,6 +71,10 @@ def build_env(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--num-pods", type=int, required=True, help="number of independent GPU pods to create")
+    parser.add_argument(
+        "--shard-offset", type=int, default=0,
+        help="starting shard_id for this batch (e.g. 1 if shard 0 is already running elsewhere) -- avoids reusing a pod name/heartbeat key from a prior launch",
+    )
     parser.add_argument("--gpu-type-id", default=DEFAULT_GPU_TYPE_ID, choices=GPU_TYPE_IDS)
     parser.add_argument("--cloud-type", default="COMMUNITY", choices=["COMMUNITY", "SECURE"])
     parser.add_argument("--container-disk-gb", type=int, default=30)
@@ -131,7 +135,8 @@ def main(argv: list[str] | None = None) -> int:
 
     client = RunPodClient(secrets.runpod_api_key)
     created = []
-    for shard_id in range(args.num_pods):
+    for i in range(args.num_pods):
+        shard_id = args.shard_offset + i
         pod_id_label = f"{args.pod_name_prefix}-{shard_id}"
         env = build_env(secrets, pod_id_label, shard_id, args.git_repo_url, args.git_branch, args.github_token)
         try:
